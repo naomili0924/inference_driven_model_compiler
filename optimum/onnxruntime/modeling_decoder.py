@@ -47,7 +47,7 @@ class OnTheFlyORTModelForCausalLM(ORTModelForCausalLM):
         model_save_dir: str | Path | TemporaryDirectory | None = None,
         # export options
         inference_kwargs: dict[str, Any] | None = None,
-        module_fix_axis_fields: dict[str, Any] | None=None,
+        module_fixed_axis_fields: dict[str, Any] | None=None,
         export_by_inference: bool = False,
         skip_random_generation: bool = False,
     ) -> ORTModelForCausalLM:
@@ -164,7 +164,7 @@ class OnTheFlyORTModelForCausalLM(ORTModelForCausalLM):
         use_cache: bool = True,
         # export options
         inference_kwargs: dict[str, Any] | None = None,
-        module_fix_axis_fields: dict[str, Any] | None=None,
+        module_fixed_axis_fields: dict[str, Any] | None=None,
         export_by_inference: bool = False,
         skip_random_generation: bool = False,
         **kwargs,
@@ -199,7 +199,7 @@ class OnTheFlyORTModelForCausalLM(ORTModelForCausalLM):
             trust_remote_code=trust_remote_code,
             # export options
             inference_kwargs=inference_kwargs,
-            module_fix_axis_fields=module_fix_axis_fields,
+            module_fixed_axis_fields=module_fix_axis_fields,
             export_by_inference=export_by_inference,
             skip_random_generation=skip_random_generation,
         )
