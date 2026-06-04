@@ -1,4 +1,5 @@
 from pathlib import Path
+from typing import TYPE_CHECKING, Any, Callable
 from huggingface_hub.constants import HUGGINGFACE_HUB_CACHE
 if TYPE_CHECKING:
     from optimum.exporters.onnx.base import OnnxConfig
@@ -20,7 +21,7 @@ from optimum.exporters.utils import DisableCompileContextManager
 from optimum.exporters.onnx.convert import onnx_export_from_model
 
 def main_export(
-	model_name_or_path: str,
+    model_name_or_path: str,
     output: str | Path,
     task: str = "auto",
     opset: int | None = None,
@@ -61,7 +62,7 @@ def main_export(
     dynamo: bool = False,
     **kwargs_shapes,
 ):
-	if dtype is None:
+    if dtype is None:
         dtype = "fp32"  # Defaults to float32
 
     if optimize == "O4" and device != "cuda":
