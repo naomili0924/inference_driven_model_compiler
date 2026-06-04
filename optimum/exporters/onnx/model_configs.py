@@ -34,6 +34,7 @@ class DummyOnnxConfig(OnnxConfig):
         model_inputs: dict[str, Any] | None = None,
         model_outputs: dict[str, Any] | None = None,
         config_dim: dict[str, int] | None = None,
+        dynamic_axes: "dict[str, dict[int, str]] | None" = None,
     ):
         super().__init__(
             config=config,
@@ -43,34 +44,42 @@ class DummyOnnxConfig(OnnxConfig):
             float_dtype=float_dtype,
         )
         self.task = task
-        self.model_inputs  = model_inputs  or {}
-        self.model_outputs = model_outputs or {}
-        self.config_dim    = config_dim    or {}
-        self._input_gen    = DummyTupleInputGenerator(task=task, config_dim=self.config_dim)
+        self.model_inputs    = model_inputs  or {}
+        self.model_outputs   = model_outputs or {}
+        self.config_dim      = config_dim    or {}
+        self._dynamic_axes   = dynamic_axes  or {}   # empirically derived
+        self._input_gen      = DummyTupleInputGenerator(task=task, config_dim=self.config_dim)
 
         # Tell ModelPatcher to enable KV-cache output when past_key_values are present
         has_kv = any(k.startswith("past_key_values.") for k in self.model_inputs)
-        self.use_past          = has_kv
+        self.use_past           = has_kv
         self.use_past_in_inputs = has_kv
 
     # ── helpers ────────────────────────────────────────────────────────────
 
     @staticmethod
     def _is_kv(name: str) -> bool:
-        return bool(re.match(r"^past_key_values\.\d+\.(key|value)$", name))
+        return bool(re.match(r"^(past_key_values|present)\.\d+\.(key|value)$", name))
 
-    def _infer_axes(self, shape: tuple[int, ...], name: str) -> dict[int, str]:
-        """Mark batch (dim-0) and any non-fixed dim as dynamic."""
-        axes: dict[int, str] = {}
+    def _axes_for(self, name: str, shape: tuple) -> dict[int, str]:
+        """Return dynamic-axes dict for one tensor.
+
+        Priority:
+        1. Empirically derived axes from multi-trial tracing (``_dynamic_axes``).
+        2. Fallback heuristic: dim-0 always dynamic; other dims dynamic only if
+           they don't match any fixed config dimension value.
+        """
+        if name in self._dynamic_axes:
+            return self._dynamic_axes[name]
+
+        # ── fallback heuristic (single-trial or missing) ──
+        axes: dict[int, str] = {0: "batch"}
         for idx, dim in enumerate(shape):
             if idx == 0:
-                axes[0] = "batch"
                 continue
             if self._is_kv(name) and idx == 2:
-                # past-sequence length is always dynamic for KV tensors
                 axes[idx] = f"{name}_dim_{idx}"
                 continue
-            # mark dynamic if it doesn't match any fixed config dim
             if not any(v == dim for v in self.config_dim.values()):
                 axes[idx] = f"{name}_dim_{idx}"
         return axes
@@ -82,12 +91,12 @@ class DummyOnnxConfig(OnnxConfig):
         result = {}
         for name, val in self.model_inputs.items():
             shape = tuple(val.shape) if isinstance(val, torch.Tensor) else val
-            result[name] = self._infer_axes(shape, name)
+            result[name] = self._axes_for(name, shape)
         return result
 
     @property
     def outputs(self) -> dict[str, dict[int, str]]:
-        return {name: self._infer_axes(shape, name) for name, shape in self.model_outputs.items()}
+        return {name: self._axes_for(name, shape) for name, shape in self.model_outputs.items()}
 
     def generate_dummy_inputs(
         self,

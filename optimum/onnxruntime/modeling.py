@@ -71,14 +71,16 @@ def _on_the_fly_export(
     )
     pytorch_model.eval()
 
-    # 3. Trace shapes
-    inputs, outputs = trace_model_shapes(
+    # 3. Trace shapes across multiple varied runs to derive dynamic axes
+    n_trials = extra_from_pretrained_kwargs.pop("n_trials", 3)
+    inputs, outputs, dynamic_axes = trace_model_shapes(
         pytorch_model,
         inference_kwargs or {},
         skip_random_generation=skip_random_generation,
+        n_trials=n_trials,
     )
 
-    # 4. Build DummyOnnxConfig
+    # 4. Build DummyOnnxConfig (dynamic_axes already empirically derived)
     dim_names = (module_fixed_axis_fields or {}).get("transformer", [])
     config_dim = generate_config_dim(pytorch_model, dim_names)
     onnx_cfg = DummyOnnxConfig(
@@ -87,6 +89,7 @@ def _on_the_fly_export(
         model_inputs=inputs,
         model_outputs=outputs,
         config_dim=config_dim,
+        dynamic_axes=dynamic_axes,
     )
 
     # 5. Export — use a unique temp dir to avoid collisions across runs
@@ -102,6 +105,10 @@ def _on_the_fly_export(
         opset=onnx_cfg.DEFAULT_ONNX_OPSET,
         output_dir=save_dir,
         output_names=["transformer.onnx"],
+        # We already derive dynamic axes empirically via multi-trial tracing,
+        # so skip optimum's re-derivation (its KV flattening uses a different
+        # naming scheme and would fail validation).
+        disable_dynamic_axes_fix=True,
     )
     maybe_save_preprocessors(model_id, save_dir, src_subfolder=subfolder)
 
@@ -144,6 +151,7 @@ class _OnTheFlyORTMixin:
         module_fixed_axis_fields: "dict[str, list[str]] | None" = None,
         export_by_inference: bool = False,
         skip_random_generation: bool = False,
+        n_trials: int = 3,          # number of inference passes for axis detection
         # hub options
         subfolder: str = "",
         revision: str = "main",
@@ -184,7 +192,7 @@ class _OnTheFlyORTMixin:
                 provider_options=provider_options,
                 session_options=session_options,
                 use_io_binding=use_io_binding,
-                extra_from_pretrained_kwargs=kwargs,
+                extra_from_pretrained_kwargs={**kwargs, "n_trials": n_trials},
             )
 
         # Standard path (loading existing ONNX or normal export)

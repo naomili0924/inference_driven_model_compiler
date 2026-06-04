@@ -20,10 +20,11 @@ dummy_image = torch.randint(0, 256, (224, 224, 3)).numpy()
 encoded_input = processor(images=dummy_image, return_tensors="pt")
 # encoded_input = {"pixel_values": tensor(1,3,224,224)}
 
-# ── Trace shapes via the vision encoder ──────────────────────────────────
-inputs, outputs = trace_model_shapes(vision_model, dict(encoded_input))
+# ── Trace shapes via the vision encoder (multi-trial dynamic-axis detection) ──
+inputs, outputs, dynamic_axes = trace_model_shapes(vision_model, dict(encoded_input), n_trials=3)
 print("traced inputs :", inputs.keys())
 print("traced outputs:", outputs.keys())
+print("dynamic axes  :", dynamic_axes)
 
 config_dim = generate_config_dim(clip_model, ["projection_dim", "hidden_size"])
 onnx_cfg = DummyOnnxConfig(
@@ -32,6 +33,7 @@ onnx_cfg = DummyOnnxConfig(
     model_inputs=inputs,
     model_outputs=outputs,
     config_dim=config_dim,
+    dynamic_axes=dynamic_axes,
 )
 
 # ── Export ───────────────────────────────────────────────────────────────
@@ -42,6 +44,7 @@ export_models(
     opset=onnx_cfg.DEFAULT_ONNX_OPSET,
     output_dir=save_dir,
     output_names=["transformer.onnx"],
+    disable_dynamic_axes_fix=True,
 )
 
 # ── ORT inference ─────────────────────────────────────────────────────────
