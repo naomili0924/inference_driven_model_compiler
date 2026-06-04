@@ -68,6 +68,7 @@ def _on_the_fly_export(
         force_download=force_download,
         trust_remote_code=trust_remote_code,
         framework="pt",
+        library_name="transformers",
     )
     pytorch_model.eval()
 
@@ -116,6 +117,7 @@ def _on_the_fly_export(
     maybe_save_preprocessors(model_id, save_dir, src_subfolder=subfolder)
 
     # 6. Load ORT session from the unique temp dir
+    extra_from_pretrained_kwargs.pop("from_transformers", None)
     has_kv = onnx_cfg.use_past
     return cls._from_pretrained(
         save_dir, config,

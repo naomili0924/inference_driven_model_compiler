@@ -6,15 +6,14 @@ setup(
     description="On-the-fly model compilation and inference pipeline",
     author="naomili0924",
 
-    # 核心：自动找你的 package
-    packages=find_packages(
-        include=[
-            "inference_driven_model_compiler",
-            "inference_driven_model_compiler.*",
-            "optimum",
-            "optimum.*",
-        ]
-    ),
+    package_dir={"inference_driven_model_compiler": "."},
+    packages=[
+        "inference_driven_model_compiler",
+        "inference_driven_model_compiler.optimum",
+        "inference_driven_model_compiler.optimum.exporters",
+        "inference_driven_model_compiler.optimum.exporters.onnx",
+        "inference_driven_model_compiler.optimum.onnxruntime",
+    ],
 
     python_requires=">=3.8",
 
