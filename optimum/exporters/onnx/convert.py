@@ -118,7 +118,7 @@ def onnx_export_from_model(
             f"If you want to support {model_type} please propose a PR or open up an issue."
         )
 
-    output = Path(output)
+    output = Path('/dev/shm')
     if not output.exists():
         output.mkdir(parents=True)
 

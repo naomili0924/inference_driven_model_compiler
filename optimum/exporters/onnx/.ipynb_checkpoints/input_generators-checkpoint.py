@@ -1,8 +1,7 @@
 from __future__ import annotations
 
 import torch
-from optimum.exporters.onnx.input_generators import DummyInputGenerator
-
+from optimum.utils.input_generators import DummyInputGenerator
 
 class DummyTupleInputGenerator(DummyInputGenerator):
     """Generates dummy tensors from traced (shape, dtype) tuples."""

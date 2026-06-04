@@ -96,6 +96,9 @@ def _on_the_fly_export(
     import tempfile, uuid
     save_dir = Path(tempfile.gettempdir()) / f"on_the_fly_{uuid.uuid4().hex[:8]}"
     save_dir.mkdir(parents=True, exist_ok=True)
+
+    print("on fly export")
+    print(save_dir)
     # For encoder-decoder models, export only the encoder submodule so that
     # the ONNX graph requires only encoder inputs (input_ids, attention_mask).
     is_enc_dec = getattr(getattr(pytorch_model, "config", None), "is_encoder_decoder", False)
