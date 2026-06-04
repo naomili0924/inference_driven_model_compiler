@@ -34,8 +34,8 @@ class OnTheFlyORTModelForCausalLM(ORTModelForCausalLM):
         module_fixed_axis_fields: "dict[str, list[str]] | None" = None,
         export_by_inference: bool = False,
         skip_random_generation: bool = False,
-        # inference-driven export traces a plain forward (no past-KV)
-        use_cache: bool = False,
+        # KV cache is now supported via two-step inference tracing
+        use_cache: bool = True,
         **kwargs,
     ):
         return super().from_pretrained(
@@ -62,7 +62,7 @@ class OnTheFlyORTModelForCausalLM(ORTModelForCausalLM):
         trust_remote_code: bool = False,
         cache_dir: str = "",
         token: "bool | str | None" = None,
-        use_cache: bool = False,
+        use_cache: bool = True,
         inf_kwargs: "dict[str, Any] | None" = None,
         module_arch_fields: "dict[str, Any] | None" = None,
         export_by_inference: bool = False,
@@ -73,8 +73,8 @@ class OnTheFlyORTModelForCausalLM(ORTModelForCausalLM):
         cache_dir = cache_dir or HUGGINGFACE_HUB_CACHE
 
         task = TasksManager._infer_task_from_model_or_model_class(model_class=cls.auto_model_class)
-        # inference-driven export produces a plain forward; keep task without -with-past
-        # so the ORT model loads without expecting KV inputs
+        # Two-step tracing (prefill + decode) adds position_ids and past_key_values,
+        # so the exported model supports full KV-cached generation.
 
         save_dir_path = Path("/dev/shm")
 
