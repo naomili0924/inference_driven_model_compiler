@@ -6,6 +6,16 @@ from .modeling import (
     OnTheFlyORTModelForTokenClassification,
     OnTheFlyORTModelForQuestionAnswering,
 )
+from .modeling_diffusion import (
+    ORTDiffusionPipeline,
+    ORTModelMixin,
+    ORTUnet,
+    ORTTransformer,
+    ORTTextEncoder,
+    ORTVaeEncoder,
+    ORTVaeDecoder,
+    ORTVae,
+)
 
 __all__ = [
     "OnTheFlyORTModelForCausalLM",
@@ -14,4 +24,12 @@ __all__ = [
     "OnTheFlyORTModelForSequenceClassification",
     "OnTheFlyORTModelForTokenClassification",
     "OnTheFlyORTModelForQuestionAnswering",
+    "ORTDiffusionPipeline",
+    "ORTModelMixin",
+    "ORTUnet",
+    "ORTTransformer",
+    "ORTTextEncoder",
+    "ORTVaeEncoder",
+    "ORTVaeDecoder",
+    "ORTVae",
 ]
