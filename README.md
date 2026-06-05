@@ -142,6 +142,8 @@ print(tokenizer.decode(output_ids[0]))
 All live in `inference_driven_model_compiler.optimum.onnxruntime` and share the
 same `from_pretrained(...)` interface:
 
+### Transformer models
+
 | Class | Task |
 |---|---|
 | `OnTheFlyORTModelForCausalLM` | Text generation (decoder-only, KV cache) |
@@ -150,6 +152,66 @@ same `from_pretrained(...)` interface:
 | `OnTheFlyORTModelForSequenceClassification` | Sequence classification |
 | `OnTheFlyORTModelForTokenClassification` | Token classification / NER |
 | `OnTheFlyORTModelForQuestionAnswering` | Extractive QA |
+
+### Diffusion pipelines
+
+| Class | Purpose |
+|---|---|
+| `ORTDiffusionPipeline` | Generic base — wraps **any** `diffusers.DiffusionPipeline` |
+| `ORTUnet` | ORT session wrapper for a UNet2D/3D denoiser |
+| `ORTTransformer` | ORT session wrapper for a DiT/transformer denoiser |
+| `ORTTextEncoder` | ORT session wrapper for a text encoder |
+| `ORTVaeEncoder` | ORT session wrapper for a VAE encoder |
+| `ORTVaeDecoder` | ORT session wrapper for a VAE decoder |
+| `ORTVae` | Combines `ORTVaeEncoder` + `ORTVaeDecoder` behind the standard `vae` API |
+
+`ORTDiffusionPipeline` requires no model-specific subclass. When called as the
+base class it reads `_class_name` from the model's `model_index.json` and creates
+an `ORT<ClassName>` wrapper on the fly via `_make_ort_pipeline_class`. Every
+diffusers pipeline — including ones not yet written — is handled automatically.
+
+```python
+from inference_driven_model_compiler.optimum.onnxruntime import ORTDiffusionPipeline
+
+# Export a Stable Diffusion pipeline to ONNX and load it in one call
+pipe = ORTDiffusionPipeline.from_pretrained(
+    "runwayml/stable-diffusion-v1-5",
+    export=True,            # export the PyTorch model to ONNX first
+    provider="CUDAExecutionProvider",
+)
+image = pipe("a photo of an astronaut riding a horse").images[0]
+```
+
+For a pipeline that is already exported (or downloaded from the Hub with ONNX
+weights):
+
+```python
+pipe = ORTDiffusionPipeline.from_pretrained(
+    "optimum/stable-diffusion-v1-5",   # Hub repo with pre-exported ONNX weights
+    export=False,
+)
+```
+
+#### Text-to-video pipelines
+
+Every text-to-video pipeline in `diffusers` works without any new code:
+
+```python
+# Wan — no ORTWanPipeline class needed
+pipe = ORTDiffusionPipeline.from_pretrained("Wan-AI/Wan2.1-T2V-1.3B-Diffusers", export=True)
+
+# CogVideoX
+pipe = ORTDiffusionPipeline.from_pretrained("THUDM/CogVideoX-2b", export=True)
+
+# HunyuanVideo
+pipe = ORTDiffusionPipeline.from_pretrained("tencent/HunyuanVideo", export=True)
+```
+
+The complete list of verified text-to-video pipeline names (as of diffusers 0.38):
+`AnimateDiffPipeline`, `AnimateDiffSDXLPipeline`, `CogVideoXPipeline`,
+`HunyuanVideo15Pipeline`, `HunyuanVideoPipeline`, `LTXPipeline`, `LTX2Pipeline`,
+`LattePipeline`, `MochiPipeline`, `SanaVideoPipeline`, `TextToVideoSDPipeline`,
+`WanPipeline`, `WanAnimatePipeline`.
 
 ---
 
@@ -170,26 +232,48 @@ same `from_pretrained(...)` interface:
 ## Tests
 
 ```bash
-cd /path/to/parent_of_repo
+cd /workspace   # must be the parent of the repo — avoids optimum/ shadowing
 
-# Per-model end-to-end export + inference
-PYTHONPATH=. python3 inference_driven_model_compiler/on_the_fly_pipeline_tests/gpt2_text_generation.py
-PYTHONPATH=. python3 inference_driven_model_compiler/on_the_fly_pipeline_tests/bert_masked_lm.py
-# … etc.
+# Run all tests (14 transformer tests + 1 diffusion test suite)
+bash inference_driven_model_compiler/run_tests.sh
 
-# Dynamic-axis inference correctness (structural — 140 checks)
-PYTHONPATH=. python3 inference_driven_model_compiler/on_the_fly_pipeline_tests/test_dynamic_axes.py
+# Run a single file
+TESTS="bert_feature_extraction.py" bash inference_driven_model_compiler/run_tests.sh
 
-# Dynamic sequence-length inference (runtime — 12 checks)
-PYTHONPATH=. python3 inference_driven_model_compiler/on_the_fly_pipeline_tests/test_dynamic_seq_length.py
+# Set timeout per test (default 600 s)
+TIMEOUT=120 bash inference_driven_model_compiler/run_tests.sh
 ```
 
-- **`test_dynamic_axes.py`** — asserts each dimension is labelled dynamic/static
-  correctly for BERT, GPT-2, ViT and T5 (batch & seq dynamic; hidden_size,
-  num_heads, head_dim, vocab, patch-count static).
-- **`test_dynamic_seq_length.py`** — exports each model once, then runs the
-  ONNX model at sequence lengths and batch sizes **different from the trace**,
-  proving the dynamic axes work at runtime.
+### Transformer model tests (`on_the_fly_pipeline_tests/`)
+
+| File | What it tests |
+|---|---|
+| `bert_feature_extraction.py` | BERT encoder → feature extraction |
+| `bert_masked_lm.py` | BERT masked-LM |
+| `bert_sequence_classification.py` | BERT sequence classification |
+| `bert_token_classification.py` | BERT NER |
+| `bert_qa.py` | BERT extractive QA |
+| `gpt2_text_generation.py` | GPT-2 text generation with KV cache |
+| `t5_feature_extraction.py` | T5 encoder feature extraction |
+| `bart_feature_extraction.py` | BART encoder feature extraction |
+| `vit_feature_extraction.py` | ViT vision encoder |
+| `clip_feature_extraction.py` | CLIP vision encoder |
+| `whisper_feature_extraction.py` | Whisper audio encoder |
+| `sentence_transformer_feature_extraction.py` | Sentence-Transformers BERT |
+| `test_dynamic_axes.py` | 140 structural checks: each dim is labelled dynamic/static correctly for BERT, GPT-2, ViT, T5 |
+| `test_dynamic_seq_length.py` | 12 runtime checks: exported ONNX runs at shapes different from the trace |
+
+### Diffusion pipeline tests (`on_the_fly_pipeline_tests/test_diffusion_pipeline.py`)
+
+43 unit tests — no GPU or model download required (all sessions are mocked):
+
+- `TestMakeORTPipelineClass` — `_make_ort_pipeline_class` for each of the 13 text-to-video pipelines
+- `TestDynamicClassCoverage` — future pipelines, MRO order, no missing pipeline names
+- `TestTextToVideoPipelineClasses` — explicit per-pipeline regression guard
+- `TestFromPretrainedMocked` — `from_pretrained` class-selection, subclass identity, unknown-name error
+- `TestSubmoduleForward` — `ORTTransformer`, `ORTTextEncoder`, `ORTVaeEncoder`, `ORTVaeDecoder`, `ORTUnet` forward with mocked sessions
+- `TestIOBindingWiring` — `set_io_binding_file`, `load_shapes_as_torch_size`
+- `TestORTVae` — encode/decode, encoder-only, decoder-only
 
 ---
 
@@ -199,15 +283,18 @@ PYTHONPATH=. python3 inference_driven_model_compiler/on_the_fly_pipeline_tests/t
 inference_driven_model_compiler/
 ├── optimum/
 │   ├── exporters/onnx/
-│   │   ├── utils.py            # trace_model_shapes(), dynamic-axis inference
-│   │   ├── model_configs.py    # DummyOnnxConfig — generic shape-driven OnnxConfig
-│   │   ├── input_generators.py # DummyTupleInputGenerator — dtype-aware dummies
-│   │   └── __init__.py          # main_export wrapper (renamed params)
+│   │   ├── utils.py              # trace_model_shapes(), dynamic-axis inference
+│   │   ├── model_configs.py      # DummyOnnxConfig — generic shape-driven OnnxConfig
+│   │   ├── input_generators.py   # DummyTupleInputGenerator — dtype-aware dummies
+│   │   └── __init__.py           # main_export wrapper (renamed params)
 │   └── onnxruntime/
-│       ├── modeling.py          # _OnTheFlyORTMixin + 5 encoder model classes
-│       └── modeling_decoder.py  # OnTheFlyORTModelForCausalLM
-├── on_the_fly_pipeline_tests/   # per-model tests + dynamic-axis test suites
-└── baseline_pipeline_tests/     # plain Optimum baselines for comparison
+│       ├── modeling.py           # _OnTheFlyORTMixin + 5 encoder model classes
+│       ├── modeling_decoder.py   # OnTheFlyORTModelForCausalLM
+│       ├── modeling_diffusion.py # ORTDiffusionPipeline + submodule wrappers
+│       └── utils.py              # load_shapes_as_torch_size and helpers
+├── on_the_fly_pipeline_tests/    # per-model tests + dynamic-axis + diffusion suites
+├── baseline_pipeline_tests/      # plain Optimum baselines for comparison
+└── run_tests.sh                  # test runner (run from /workspace)
 ```
 
 ---
