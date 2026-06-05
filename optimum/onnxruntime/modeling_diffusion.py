@@ -166,6 +166,10 @@ class ORTTransformer(ORTModelMixin):
         joint_attention_kwargs: dict[str, Any] | None = None,
         encoder_attention_mask: torch.Tensor | None = None,
         attention_kwargs: dict[str, Any] | None = None,
+        # CogVideoX-specific (constant-folded into ONNX, accepted but not forwarded)
+        timestep_cond: np.ndarray | torch.Tensor | None = None,
+        ofs: np.ndarray | torch.Tensor | None = None,
+        image_rotary_emb: tuple | None = None,
         return_dict: bool = True,
     ):
         use_torch = isinstance(hidden_states, torch.Tensor)
@@ -308,6 +312,7 @@ class ORTVaeDecoder(ORTModelMixin):
         super().__init__(*args, **kwargs)
         if not hasattr(self.config, "scaling_factor") and hasattr(self.config, "block_out_channels"):
             self.register_to_config(scaling_factor=2 ** (len(self.config.block_out_channels) - 1))
+        self._cpu_session = None  # lazily created if GPU OOM occurs
 
     def forward(
         self,
@@ -323,22 +328,30 @@ class ORTVaeDecoder(ORTModelMixin):
         actual_input_name = next(iter(self.input_names)) if self.input_names else "latent_sample"
         model_inputs = {actual_input_name: latent_sample}
 
-        if self.use_io_binding:
-            known_output_shapes = load_shapes_as_torch_size(self.io_binding_file)
-            output_shapes, output_buffers = self._prepare_io_binding(
-                model_inputs, known_output_shapes=known_output_shapes, known_output_buffers=None
-            )
-            if self.device.type == "cpu":
-                self.session.run_with_iobinding(self._io_binding)
-            else:
-                self._io_binding.synchronize_inputs()
-                self.session.run_with_iobinding(self._io_binding)
-                self._io_binding.synchronize_outputs()
-            model_outputs = {name: output_buffers[name].view(output_shapes[name]) for name in self.output_names}
-        else:
-            onnx_inputs = self._prepare_onnx_inputs(use_torch, model_inputs)
+        # VAE decoder: try GPU session first; on OOM fall back to CPU session.
+        # The full-video upsample intermediates can exceed the CUDA BFC arena limit.
+        import onnxruntime as ort
+        onnx_inputs = self._prepare_onnx_inputs(use_torch, model_inputs)
+        try:
             onnx_outputs = self.session.run(None, onnx_inputs)
-            model_outputs = self._prepare_onnx_outputs(use_torch, onnx_outputs)
+        except Exception as gpu_err:
+            if "allocate memory" not in str(gpu_err) and "RuntimeException" not in str(gpu_err):
+                raise
+            # GPU OOM — create / reuse a CPU session
+            if self._cpu_session is None:
+                logger.warning(
+                    "VAE decoder GPU OOM — falling back to CPU execution for decode step."
+                )
+                self._cpu_session = ort.InferenceSession(
+                    self.session._model_path,
+                    providers=["CPUExecutionProvider"],
+                )
+            cpu_inputs = {
+                k: (v.cpu().numpy() if isinstance(v, torch.Tensor) else v)
+                for k, v in onnx_inputs.items()
+            }
+            onnx_outputs = self._cpu_session.run(None, cpu_inputs)
+        model_outputs = self._prepare_onnx_outputs(use_torch, onnx_outputs)
 
         if not return_dict:
             return tuple(model_outputs.values())
@@ -456,6 +469,8 @@ def _on_the_fly_diffusion_export(
         _pqc = getattr(vae, "post_quant_conv", None)
         _dec = getattr(vae, "decoder", None)
         if _pqc is not None and _dec is not None:
+            # WAN-style: post_quant_conv is called ONCE on the full latent.
+            # Hook pqc to capture the full z; export pqc+decoder together.
             class _VaeFullDecodeWrapper(torch.nn.Module):
                 def __init__(self, pqc, dec):
                     super().__init__()
@@ -463,12 +478,31 @@ def _on_the_fly_diffusion_export(
                     self.dec = dec
 
                 def forward(self, x):
-                    return self.dec(self.pqc(x))
+                    out = self.dec(self.pqc(x))
+                    # Some decoders (e.g. CogVideoX) return (tensor, conv_cache_dict).
+                    # Only the decoded tensor is needed for ONNX.
+                    return out[0] if isinstance(out, (list, tuple)) else out
 
             _vae_full_decode = _VaeFullDecodeWrapper(_pqc, _dec)
-            # Hook post_quant_conv to capture the full latent z (its first positional arg).
-            # We add a "virtual" spec entry that hooks pqc but exports the full wrapper.
             specs.append(("vae_decoder", _pqc, DIFFUSION_MODEL_VAE_DECODER_SUBFOLDER, vae))
+            _vae_decode_export_overrides = {"vae_decoder": _vae_full_decode}
+
+        elif _dec is not None:
+            # CogVideoX-style: post_quant_conv is None; decoder is called directly
+            # per-frame-batch with the raw latent slice. Hook the decoder to capture
+            # a representative slice, then export a wrapper that accepts z and returns
+            # only the decoded tensor (dropping conv_cache).
+            class _VaeNoQuantDecodeWrapper(torch.nn.Module):
+                def __init__(self, dec):
+                    super().__init__()
+                    self.dec = dec
+
+                def forward(self, z):
+                    out = self.dec(z)
+                    return out[0] if isinstance(out, (list, tuple)) else out
+
+            _vae_full_decode = _VaeNoQuantDecodeWrapper(_dec)
+            specs.append(("vae_decoder", _dec, DIFFUSION_MODEL_VAE_DECODER_SUBFOLDER, vae))
             _vae_decode_export_overrides = {"vae_decoder": _vae_full_decode}
         else:
             _vae_decode_export_overrides = {}
@@ -541,6 +575,21 @@ def _on_the_fly_diffusion_export(
     for _, wrapper_mod in _vae_decode_export_overrides.items():
         wrapper_mod.cpu()
 
+    # Normalize the vae_decoder captured input key to "z" when exported via
+    # _VaeNoQuantDecodeWrapper (CogVideoX-style, no post_quant_conv).  The hook
+    # names the key after the decoder's first parameter ("sample" for CogVideoX),
+    # but the wrapper's forward signature uses "z" so trace_model_shapes must
+    # receive {"z": tensor}.
+    if "vae_decoder" in captured and "vae_decoder" in _vae_decode_export_overrides:
+        wrapper = _vae_decode_export_overrides["vae_decoder"]
+        if hasattr(wrapper, "dec") and not hasattr(wrapper, "pqc"):
+            # _VaeNoQuantDecodeWrapper — rename first captured tensor key to "z"
+            cap = captured["vae_decoder"]
+            tensor_keys = [k for k, v in cap.items() if torch.is_tensor(v)]
+            if tensor_keys and tensor_keys[0] != "z":
+                cap["z"] = cap.pop(tensor_keys[0])
+                captured["vae_decoder"] = cap
+
     # 5. Trace shapes and build ONNX configs for each captured submodule
     output = Path(output)
     output.mkdir(parents=True, exist_ok=True)
@@ -579,6 +628,13 @@ def _on_the_fly_diffusion_export(
                 f"Shape tracing failed for '{name}': {exc}\n{traceback.format_exc()} — skipping."
             )
             continue
+
+        # For vae_decoder the captured input is a single chunk (e.g. 3 frames), but at
+        # inference the full temporal extent varies.  Force dim-2 (frames) to be dynamic
+        # so the exported ONNX accepts any number of frames.
+        if name == "vae_decoder":
+            for inp_name in list(dynamic_axes.keys()):
+                dynamic_axes[inp_name][2] = "num_frames"
 
         dim_names = (module_fixed_axis_fields or {}).get(name, [])
         cfg = (
