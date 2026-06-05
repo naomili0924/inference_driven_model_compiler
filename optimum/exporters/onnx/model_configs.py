@@ -105,6 +105,10 @@ class DummyOnnxConfig(OnnxConfig):
         float_dtype: str = "fp32",
         **kwargs,
     ) -> dict[str, Any]:
+        # Prefer the dtype stored at construction time (detected from the actual model)
+        # over the caller's default "fp32" so fp16 models export with fp16 dummy inputs.
+        float_dtype = self.float_dtype
+
         kv: dict[tuple, torch.Tensor] = {}
         flat: dict[str, torch.Tensor] = {}
 

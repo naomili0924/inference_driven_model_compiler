@@ -316,7 +316,12 @@ class ORTVaeDecoder(ORTModelMixin):
         return_dict: bool = True,
     ):
         use_torch = isinstance(latent_sample, torch.Tensor)
-        model_inputs = {"latent_sample": latent_sample}
+        # The ONNX model's first input may be named "latent_sample" (standard) or
+        # the raw forward-argument name like "x" (inference-driven export from WanDecoder).
+        # Use the actual session input name so _prepare_io_binding can find it.
+        # input_names is a {name: idx} dict, so use next(iter(...)) for the first key.
+        actual_input_name = next(iter(self.input_names)) if self.input_names else "latent_sample"
+        model_inputs = {actual_input_name: latent_sample}
 
         if self.use_io_binding:
             known_output_shapes = load_shapes_as_torch_size(self.io_binding_file)
@@ -355,6 +360,326 @@ class ORTVae(ORTParentMixin):
     @property
     def config(self):
         return self.decoder.config
+
+
+def _register_onnx_upsample_symbolics():
+    """Register custom ONNX symbolic for aten::_upsample_nearest_exact2d.
+
+    PyTorch's nearest-exact upsampling has no built-in ONNX opset-18 symbolic.
+    Map it to the ONNX Resize op (nearest mode, half_pixel coordinates).
+    The JIT op signature is: (input, output_size, scale_factors[h, w])
+    so scale_h here is the [h_scale, w_scale] float[] constant.
+    """
+    try:
+        from torch.onnx import symbolic_helper
+
+        @symbolic_helper.parse_args("v", "v", "v")
+        def _upsample_nearest_exact2d_sym(g, input, output_size, scale_h=None):
+            # scale_h = [h_scale, w_scale]; prepend [1.0, 1.0] for batch + channel.
+            ones = g.op("Constant", value_t=torch.tensor([1.0, 1.0], dtype=torch.float32))
+            scales = g.op("Concat", ones, scale_h, axis_i=0)
+            empty_roi = g.op("Constant", value_t=torch.tensor([], dtype=torch.float32))
+            return g.op(
+                "Resize", input, empty_roi, scales,
+                mode_s="nearest",
+                coordinate_transformation_mode_s="half_pixel",
+                nearest_mode_s="round_prefer_floor",
+            )
+
+        torch.onnx.register_custom_op_symbolic(
+            "aten::_upsample_nearest_exact2d",
+            _upsample_nearest_exact2d_sym,
+            18,
+        )
+    except Exception as exc:
+        logger.warning(f"Could not register _upsample_nearest_exact2d symbolic: {exc}")
+
+
+def _on_the_fly_diffusion_export(
+    model_name_or_path,
+    output,
+    inference_kwargs,
+    module_fixed_axis_fields=None,
+    torch_dtype=None,
+    device="cpu",
+    hub_kwargs=None,
+    n_trials=3,
+    skip_random_generation=False,
+):
+    """Load the PyTorch diffusion pipeline, trace per-submodule tensor shapes
+    via forward hooks on one inference pass, then export each submodule to ONNX.
+    """
+    import json
+    import inspect
+    from types import SimpleNamespace
+
+    from inference_driven_model_compiler.optimum.exporters.onnx.utils import (
+        trace_model_shapes,
+        generate_config_dim,
+    )
+    from inference_driven_model_compiler.optimum.exporters.onnx.model_configs import DummyOnnxConfig
+
+    _register_onnx_upsample_symbolics()
+
+    # 1. Load the PyTorch pipeline
+    load_kw = {**(hub_kwargs or {})}
+    if torch_dtype is not None:
+        load_kw["torch_dtype"] = torch_dtype
+    pt_pipeline = DiffusionPipeline.from_pretrained(str(model_name_or_path), **load_kw)
+    pt_pipeline = pt_pipeline.to(device)
+
+    # 2. Collect submodules to export: (name, module, subfolder, config_source)
+    vae = getattr(pt_pipeline, "vae", None)
+    specs = []
+    _vae_decode_export_overrides: dict[str, torch.nn.Module] = {}
+    for name, subfolder in [
+        ("text_encoder",   DIFFUSION_MODEL_TEXT_ENCODER_SUBFOLDER),
+        ("text_encoder_2", DIFFUSION_MODEL_TEXT_ENCODER_2_SUBFOLDER),
+        ("text_encoder_3", DIFFUSION_MODEL_TEXT_ENCODER_3_SUBFOLDER),
+        ("transformer",    DIFFUSION_MODEL_TRANSFORMER_SUBFOLDER),
+        ("unet",           DIFFUSION_MODEL_UNET_SUBFOLDER),
+    ]:
+        mod = getattr(pt_pipeline, name, None)
+        if isinstance(mod, torch.nn.Module):
+            specs.append((name, mod, subfolder, mod))
+    if vae is not None:
+        for vae_name, vae_attr, vae_subfolder in [
+            ("vae_encoder", "encoder", DIFFUSION_MODEL_VAE_ENCODER_SUBFOLDER),
+        ]:
+            sub = getattr(vae, vae_attr, None)
+            if isinstance(sub, torch.nn.Module):
+                specs.append((vae_name, sub, vae_subfolder, vae))
+
+        # For vae_decoder: hook post_quant_conv to capture the full latent z,
+        # then export a wrapper (post_quant_conv → decoder) that takes the full
+        # latent and decodes it in one shot (no frame-by-frame caching in ONNX).
+        _pqc = getattr(vae, "post_quant_conv", None)
+        _dec = getattr(vae, "decoder", None)
+        if _pqc is not None and _dec is not None:
+            class _VaeFullDecodeWrapper(torch.nn.Module):
+                def __init__(self, pqc, dec):
+                    super().__init__()
+                    self.pqc = pqc
+                    self.dec = dec
+
+                def forward(self, x):
+                    return self.dec(self.pqc(x))
+
+            _vae_full_decode = _VaeFullDecodeWrapper(_pqc, _dec)
+            # Hook post_quant_conv to capture the full latent z (its first positional arg).
+            # We add a "virtual" spec entry that hooks pqc but exports the full wrapper.
+            specs.append(("vae_decoder", _pqc, DIFFUSION_MODEL_VAE_DECODER_SUBFOLDER, vae))
+            _vae_decode_export_overrides = {"vae_decoder": _vae_full_decode}
+        else:
+            _vae_decode_export_overrides = {}
+
+    # 3. Register forward pre-hooks to capture each submodule's first-call inputs.
+    # We snapshot (deep-copy) values immediately — some models (e.g. WanDecoder3d)
+    # pass mutable lists (feat_cache, feat_idx) that are mutated in-place during
+    # the forward pass, so a plain reference would be stale by the time we use it.
+    import copy
+
+    captured = {}
+    hooks = []
+    for name, mod, _, _ in specs:
+        fwd_params = list(inspect.signature(mod.forward).parameters.keys())
+        fwd_param_set = set(fwd_params)
+
+        def make_hook(mod_name, param_list, param_set):
+            def hook(module, args, kwargs_fwd):
+                if mod_name in captured:
+                    return
+
+                def _snap(v):
+                    if torch.is_tensor(v):
+                        return v.detach().clone()
+                    if isinstance(v, (list, tuple, dict)):
+                        return copy.deepcopy(v)
+                    return v
+
+                bound = {}
+                for i, arg in enumerate(args):
+                    if i < len(param_list):
+                        bound[param_list[i]] = _snap(arg)
+                if kwargs_fwd:
+                    for k, v in kwargs_fwd.items():
+                        if k in param_set:
+                            bound[k] = _snap(v)
+                captured[mod_name] = bound
+            return hook
+
+        h = mod.register_forward_pre_hook(
+            make_hook(name, fwd_params, fwd_param_set), with_kwargs=True
+        )
+        hooks.append(h)
+
+    # 4. Run one full pipeline inference pass — hooks capture submodule inputs
+    with torch.no_grad():
+        pt_pipeline(**inference_kwargs)
+
+    for h in hooks:
+        h.remove()
+
+    # Move each captured submodule to CPU so ONNX export dummy inputs (always CPU)
+    # match the model device, and so shape-variation trials don't hit device mismatches.
+    def _to_cpu(v):
+        if torch.is_tensor(v):
+            return v.cpu()
+        if isinstance(v, list):
+            return [_to_cpu(x) for x in v]
+        if isinstance(v, tuple):
+            return tuple(_to_cpu(x) for x in v)
+        if isinstance(v, dict):
+            return {k2: _to_cpu(v2) for k2, v2 in v.items()}
+        return v
+
+    for name, mod, _, _ in specs:
+        if name in captured:
+            mod.cpu()
+            captured[name] = {k: _to_cpu(v) for k, v in captured[name].items()}
+    # Also move the full vae_decoder wrapper (which includes pqc + decoder) to CPU
+    for _, wrapper_mod in _vae_decode_export_overrides.items():
+        wrapper_mod.cpu()
+
+    # 5. Trace shapes and build ONNX configs for each captured submodule
+    output = Path(output)
+    output.mkdir(parents=True, exist_ok=True)
+
+    models_and_onnx_configs = {}
+    ordered_names = []
+    subfolder_map = {}
+    io_binding_outputs = {}
+
+    for name, mod, subfolder, config_src in specs:
+        if name not in captured:
+            logger.warning(f"Submodule '{name}' was not called during inference — skipping ONNX export.")
+            continue
+
+        # Pass only tensor inputs to trace_model_shapes — non-tensor arguments
+        # (e.g. feat_cache, feat_idx, first_chunk, return_dict) are internal state
+        # that don't belong in the ONNX interface and would cause mutable-list
+        # mutation issues across multiple tracing trials.
+        tensor_inputs = {k: v for k, v in captured[name].items() if torch.is_tensor(v)}
+        if not tensor_inputs:
+            logger.warning(f"Submodule '{name}' has no tensor inputs — skipping ONNX export.")
+            continue
+        # For vae_decoder: trace the full wrapper (pqc + decoder) using the
+        # captured pqc inputs, so the output shapes reflect the decoded video.
+        trace_mod = _vae_decode_export_overrides.get(name, mod)
+        try:
+            inputs, outputs, dynamic_axes = trace_model_shapes(
+                trace_mod,
+                tensor_inputs,
+                skip_random_generation=skip_random_generation,
+                n_trials=n_trials,
+            )
+        except Exception as exc:
+            import traceback
+            logger.warning(
+                f"Shape tracing failed for '{name}': {exc}\n{traceback.format_exc()} — skipping."
+            )
+            continue
+
+        dim_names = (module_fixed_axis_fields or {}).get(name, [])
+        cfg = (
+            getattr(config_src, "config", None)
+            or getattr(mod, "config", None)
+            or SimpleNamespace(model_type="placeholder")
+        )
+        # For vae_decoder/vae_encoder, mod has no .config — use config_src (the VAE)
+        config_dim_src = config_src if hasattr(config_src, "config") else mod
+        config_dim = generate_config_dim(config_dim_src, dim_names)
+
+        # Detect float dtype from the captured inputs (actual tensors from inference),
+        # not from model parameters (which may be mixed fp16/fp32 across layers).
+        float_dtype = "fp32"
+        for _v in captured[name].values():
+            if torch.is_tensor(_v) and _v.is_floating_point():
+                if _v.dtype == torch.float16:
+                    float_dtype = "fp16"
+                elif _v.dtype == torch.bfloat16:
+                    float_dtype = "bf16"
+                break
+
+        onnx_cfg = DummyOnnxConfig(
+            config=cfg,
+            task="backbone",
+            model_inputs=inputs,
+            model_outputs=outputs,
+            config_dim=config_dim,
+            dynamic_axes=dynamic_axes,
+            float_dtype=float_dtype,
+        )
+
+        # export_pytorch does `model.config.return_dict = True` unconditionally.
+        # Sub-modules (e.g. WanDecoder3d) have no .config — attach a fake one.
+        if not hasattr(mod, "config"):
+            mod.config = cfg  # SimpleNamespace or real config, both work here
+
+        (output / subfolder).mkdir(parents=True, exist_ok=True)
+        models_and_onnx_configs[name] = (mod, onnx_cfg)
+        ordered_names.append(name)
+        subfolder_map[name] = subfolder
+        io_binding_outputs[name] = outputs
+
+    # 6. Export each submodule to ONNX individually.
+    # We export per-model (not via export_models) so we can pass return_dict=False
+    # only for models whose forward signature actually has that parameter.
+    # optimum's override_arguments injects model_kwargs unconditionally into
+    # **kwargs even when the parameter is absent, causing TypeError.
+    if models_and_onnx_configs:
+        from optimum.exporters.onnx.convert import export as onnx_export_one
+        opset = max(cfg.DEFAULT_ONNX_OPSET for _, cfg in models_and_onnx_configs.values())
+        for n in ordered_names:
+            mod_n, onnx_cfg_n = models_and_onnx_configs[n]
+            # Use the wrapper module if available (e.g. vae_decoder: pqc + decoder)
+            export_mod = _vae_decode_export_overrides.get(n, mod_n)
+            # Ensure the export module has a fake config for export_pytorch
+            if not hasattr(export_mod, "config"):
+                export_mod.config = mod_n.config if hasattr(mod_n, "config") else SimpleNamespace()
+            has_return_dict = "return_dict" in inspect.signature(export_mod.forward).parameters
+            mk = {"return_dict": False} if has_return_dict else {}
+            onnx_path = output / subfolder_map[n] / ONNX_WEIGHTS_NAME
+            # Disable constant folding for text encoders — T5/UMT5 models have
+            # relative position attention biases that get precomputed into very large
+            # ONNX constants when constant folding is enabled, inflating the model size.
+            is_text_enc = "text_encoder" in n
+            onnx_export_one(
+                model=export_mod,
+                config=onnx_cfg_n,
+                output=onnx_path,
+                opset=opset,
+                disable_dynamic_axes_fix=True,
+                model_kwargs=mk,
+                do_constant_folding=not is_text_enc,
+            )
+
+    # 7. Save per-submodule config.json (required by ORTModelMixin.__init__)
+    for name, mod, subfolder, config_src in specs:
+        if name not in models_and_onnx_configs:
+            continue
+        out_sub = output / subfolder
+        if hasattr(config_src, "save_config"):
+            config_src.save_config(out_sub)
+        elif hasattr(config_src, "config") and hasattr(config_src.config, "save_pretrained"):
+            config_src.config.save_pretrained(str(out_sub))
+        elif hasattr(mod, "config") and hasattr(mod.config, "save_pretrained"):
+            mod.config.save_pretrained(str(out_sub))
+
+    # 8. Save pipeline-level components so ORTDiffusionPipeline can load them
+    pt_pipeline.save_config(output)
+    for attr in ("scheduler", "tokenizer", "tokenizer_2", "tokenizer_3", "feature_extractor"):
+        comp = getattr(pt_pipeline, attr, None)
+        if comp is not None and hasattr(comp, "save_pretrained"):
+            comp.save_pretrained(output / attr)
+
+    # 9. Write io_binding output-shape files consumed by ORTSessionMixin
+    io_dir = output / "io_binding"
+    io_dir.mkdir(exist_ok=True)
+    for name, out_shapes in io_binding_outputs.items():
+        (io_dir / f"{name}_outputs.json").write_text(
+            json.dumps({k: list(v) for k, v in out_shapes.items()}, indent=4)
+        )
 
 
 def _make_ort_pipeline_class(diffusers_class: type) -> type:
@@ -498,6 +823,11 @@ class ORTDiffusionPipeline(ORTParentMixin, DiffusionPipeline):
         cls,
         model_name_or_path: str | Path,
         export: bool | None = None,
+        export_by_inference: bool = False,
+        inference_kwargs: dict[str, Any] | None = None,
+        module_fixed_axis_fields: dict[str, list[str]] | None = None,
+        skip_random_generation: bool = False,
+        n_trials: int = 3,
         provider: str = "CPUExecutionProvider",
         providers: Sequence[str] | None = None,
         provider_options: Sequence[dict[str, Any]] | dict[str, Any] | None = None,
@@ -505,6 +835,10 @@ class ORTDiffusionPipeline(ORTParentMixin, DiffusionPipeline):
         use_io_binding: bool | None = None,
         **kwargs,
     ):
+        # Inference-driven export always requires a fresh export pass
+        if export_by_inference:
+            export = True
+
         providers, provider_options = prepare_providers_and_provider_options(
             provider=provider, providers=providers, provider_options=provider_options
         )
@@ -551,29 +885,43 @@ class ORTDiffusionPipeline(ORTParentMixin, DiffusionPipeline):
             model_save_path = Path("/dev/shm")
 
             torch_dtype = kwargs.pop("torch_dtype", None)
-            if torch_dtype is not None:
-                if torch_dtype == torch.float16:
-                    kwargs["dtype"] = "fp16"
-                elif torch_dtype == torch.float32:
-                    kwargs["dtype"] = "fp32"
-                else:
-                    raise ValueError(f"Unsupported torch_dtype for export: {torch_dtype}")
 
-            export_kwargs = {
-                "slim": kwargs.pop("slim", False),
-                "dtype": kwargs.pop("dtype", None),
-                "device": get_device_for_provider(provider, {}).type,
-                "no_dynamic_axes": kwargs.pop("no_dynamic_axes", False),
-            }
-            main_export(
-                model_name_or_path=str(model_name_or_path),
-                output=model_save_path,
-                no_post_process=True,
-                do_validation=False,
-                task="auto",
-                **{k: v for k, v in export_kwargs.items() if v is not None},
-                **hub_kwargs,
-            )
+            if export_by_inference:
+                _on_the_fly_diffusion_export(
+                    model_name_or_path=model_name_or_path,
+                    output=model_save_path,
+                    inference_kwargs=inference_kwargs or {},
+                    module_fixed_axis_fields=module_fixed_axis_fields,
+                    torch_dtype=torch_dtype,
+                    device=get_device_for_provider(provider, {}).type,
+                    hub_kwargs=hub_kwargs,
+                    n_trials=n_trials,
+                    skip_random_generation=skip_random_generation,
+                )
+            else:
+                if torch_dtype is not None:
+                    if torch_dtype == torch.float16:
+                        kwargs["dtype"] = "fp16"
+                    elif torch_dtype == torch.float32:
+                        kwargs["dtype"] = "fp32"
+                    else:
+                        raise ValueError(f"Unsupported torch_dtype for export: {torch_dtype}")
+
+                export_kwargs = {
+                    "slim": kwargs.pop("slim", False),
+                    "dtype": kwargs.pop("dtype", None),
+                    "device": get_device_for_provider(provider, {}).type,
+                    "no_dynamic_axes": kwargs.pop("no_dynamic_axes", False),
+                }
+                main_export(
+                    model_name_or_path=str(model_name_or_path),
+                    output=model_save_path,
+                    no_post_process=True,
+                    do_validation=False,
+                    task="auto",
+                    **{k: v for k, v in export_kwargs.items() if v is not None},
+                    **hub_kwargs,
+                )
 
         # download model from hub if it's not a local directory
         if not model_save_path.is_dir():
