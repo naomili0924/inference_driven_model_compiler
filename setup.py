@@ -33,6 +33,12 @@ setup(
         ],
     },
 
+    entry_points={
+        "console_scripts": [
+            "idmc=inference_driven_model_compiler.cli:main",
+        ],
+    },
+
     include_package_data=True,
     zip_safe=False,
 )
