@@ -27,6 +27,8 @@ installation.
 
 ## How it works
 
+### Transformer models
+
 ```
 from_pretrained(export_by_inference=True)
         │
@@ -49,6 +51,38 @@ from_pretrained(export_by_inference=True)
         │
         ▼
 6. ORTModel._from_pretrained()  ── load the ONNX model into an ORT session
+```
+
+### Diffusion pipelines
+
+```
+ORTDiffusionPipeline.from_pretrained(export_by_inference=True, inference_kwargs={...})
+        │
+        ▼
+1. Load the PyTorch diffusion pipeline (diffusers)
+        │
+        ▼
+2. Register forward pre-hooks on each submodule
+   (text_encoder, transformer/unet, vae.post_quant_conv)
+        │
+        ▼
+3. Run ONE full pipeline inference pass with the provided inference_kwargs
+   — all submodule inputs are captured live as real tensors
+        │
+        ▼
+4. For each submodule:
+   • Move captured tensors to CPU
+   • Build DummyOnnxConfig from the observed shapes + dynamic axes
+   • Export to ONNX (constant folding disabled for text encoders to
+     avoid 89 GB inflation from precomputed attention bias)
+        │
+        ▼
+5. VAE decoder special case: export post_quant_conv + decoder as a single
+   _VaeFullDecodeWrapper (WAN VAE decodes per-frame with caching in PyTorch;
+   ONNX needs one call over the full latent video)
+        │
+        ▼
+6. ORTDiffusionPipeline loaded with each ONNX submodule in an ORT session
 ```
 
 ### Dynamic-axis inference
@@ -128,12 +162,12 @@ print(tokenizer.decode(output_ids[0]))
 
 | Argument | Meaning |
 |---|---|
-| `inference_kwargs` | The inputs used to trace the model (e.g. a tokenized prompt). |
+| `inference_kwargs` | The inputs used to trace the model (e.g. a tokenized prompt, or full pipeline kwargs for diffusion). |
 | `export_by_inference=True` | Enable the inference-driven export path. |
-| `export=True` | Force an ONNX export (vs. loading an existing one). |
-| `module_fixed_axis_fields` | Config fields whose values should be treated as fixed dims (a hint for the static/dynamic heuristic fallback). |
+| `export=True` | Force a static ONNX export using Optimum's standard path (transformer models only). |
+| `module_fixed_axis_fields` | Per-submodule config field names whose values should be treated as fixed (static) tensor dims. |
 | `skip_random_generation` | Keep the actual traced tensors as fixed dummy inputs instead of regenerating them. |
-| `n_trials` | Number of inference passes for dynamic-axis detection (default `3`). |
+| `n_trials` | Number of inference passes for dynamic-axis detection, transformer models only (default `3`). |
 
 ---
 
@@ -170,17 +204,52 @@ base class it reads `_class_name` from the model's `model_index.json` and create
 an `ORT<ClassName>` wrapper on the fly via `_make_ort_pipeline_class`. Every
 diffusers pipeline — including ones not yet written — is handled automatically.
 
+#### Inference-driven export (recommended)
+
+Pass `export_by_inference=True` together with `inference_kwargs` (the same kwargs
+you would pass to the pipeline `__call__`). The pipeline runs once in PyTorch to
+capture real tensor shapes for every submodule, then exports each one to ONNX
+automatically — no hand-written `OnnxConfig` required.
+
 ```python
+import torch
 from inference_driven_model_compiler.optimum.onnxruntime import ORTDiffusionPipeline
 
-# Export a Stable Diffusion pipeline to ONNX and load it in one call
+inf_kwargs = {
+    "prompt": "A cat walks on the grass, realistic",
+    "negative_prompt": "low quality, blurred",
+    "height": 240,
+    "width": 416,
+    "num_frames": 21,
+    "guidance_scale": 5.0,
+}
+
 pipe = ORTDiffusionPipeline.from_pretrained(
-    "runwayml/stable-diffusion-v1-5",
-    export=True,            # export the PyTorch model to ONNX first
+    "Wan-AI/Wan2.1-T2V-1.3B-Diffusers",
     provider="CUDAExecutionProvider",
+    torch_dtype=torch.float16,
+    export_by_inference=True,
+    inference_kwargs=inf_kwargs,
+    module_fixed_axis_fields={
+        "text_encoder": ["d_model", "vocab_size"],
+        "transformer":  ["in_channels", "text_dim"],
+        "vae_decoder":  ["base_dim", "z_dim"],
+    },
 )
-image = pipe("a photo of an astronaut riding a horse").images[0]
+
+output = pipe(**inf_kwargs).frames[0]
 ```
+
+This exports three ONNX files to a temporary directory and immediately loads them
+into ORT sessions — all in one `from_pretrained` call. The exported files are:
+
+| Submodule | ONNX file | Typical size |
+|---|---|---|
+| `text_encoder` | `text_encoder/model.onnx` | ~13 GB (fp16) |
+| `transformer` | `transformer/model.onnx` | ~3 GB (fp16) |
+| `vae_decoder` | `vae_decoder/model.onnx` | ~137 MB (fp16) |
+
+#### Loading pre-exported ONNX weights
 
 For a pipeline that is already exported (or downloaded from the Hub with ONNX
 weights):
@@ -194,28 +263,52 @@ pipe = ORTDiffusionPipeline.from_pretrained(
 
 #### Text-to-video pipelines
 
-Every text-to-video pipeline in `diffusers` works without any new code:
+Every text-to-video pipeline in `diffusers` works without any new code — just
+swap in the model ID and matching `inference_kwargs`:
 
 ```python
-# Wan — no ORTWanPipeline class needed
-pipe = ORTDiffusionPipeline.from_pretrained("Wan-AI/Wan2.1-T2V-1.3B-Diffusers", export=True)
+# Wan2.1 T2V 1.3B (verified end-to-end)
+pipe = ORTDiffusionPipeline.from_pretrained(
+    "Wan-AI/Wan2.1-T2V-1.3B-Diffusers",
+    export_by_inference=True, inference_kwargs=inf_kwargs, ...
+)
 
-# CogVideoX
-pipe = ORTDiffusionPipeline.from_pretrained("THUDM/CogVideoX-2b", export=True)
+# CogVideoX — no ORTCogVideoXPipeline class needed
+pipe = ORTDiffusionPipeline.from_pretrained(
+    "THUDM/CogVideoX-2b",
+    export_by_inference=True, inference_kwargs=inf_kwargs, ...
+)
 
 # HunyuanVideo
-pipe = ORTDiffusionPipeline.from_pretrained("tencent/HunyuanVideo", export=True)
+pipe = ORTDiffusionPipeline.from_pretrained(
+    "tencent/HunyuanVideo",
+    export_by_inference=True, inference_kwargs=inf_kwargs, ...
+)
 ```
 
-The complete list of verified text-to-video pipeline names (as of diffusers 0.38):
+The complete list of supported text-to-video pipeline names (as of diffusers 0.38):
 `AnimateDiffPipeline`, `AnimateDiffSDXLPipeline`, `CogVideoXPipeline`,
 `HunyuanVideo15Pipeline`, `HunyuanVideoPipeline`, `LTXPipeline`, `LTX2Pipeline`,
 `LattePipeline`, `MochiPipeline`, `SanaVideoPipeline`, `TextToVideoSDPipeline`,
 `WanPipeline`, `WanAnimatePipeline`.
 
+#### Implementation notes
+
+- **VAE decoder**: WAN's VAE decodes per-frame with a `feat_cache` in PyTorch.
+  For ONNX, `post_quant_conv + decoder` are fused into a single
+  `_VaeFullDecodeWrapper` that processes the full latent video in one call.
+- **Text encoder constant folding**: disabled by default for text encoders to
+  avoid ONNX models inflating from ~13 GB to ~89 GB due to precomputed
+  relative-position attention bias tensors.
+- **`_upsample_nearest_exact2d`**: a custom ONNX symbolic is registered for this
+  ATen op (used by `nn.Upsample(mode='nearest-exact')` in the WAN VAE), mapping
+  it to the ONNX `Resize` op.
+
 ---
 
 ## Verified models
+
+### Transformer models
 
 | Model | Type | Task tested |
 |---|---|---|
@@ -226,6 +319,12 @@ The complete list of verified text-to-video pipeline names (as of diffusers 0.38
 | ViT-base | vision encoder | feature extraction |
 | CLIP-ViT-base | vision encoder | feature extraction |
 | Whisper-tiny | audio encoder | feature extraction |
+
+### Diffusion pipelines
+
+| Model | Pipeline | Submodules exported | Notes |
+|---|---|---|---|
+| Wan2.1-T2V-1.3B | `WanPipeline` | text_encoder, transformer, vae_decoder | Verified end-to-end on CUDA; 50-step inference at ~7.4 it/s |
 
 ---
 
@@ -324,3 +423,8 @@ never accidentally exported as dynamic.
   image inputs and returns embeddings rather than `last_hidden_state`).
 - The exported ONNX is written to a temporary directory; call
   `model.save_pretrained(...)` to persist it.
+- Diffusion pipeline export runs one full inference pass before exporting, which
+  requires enough GPU/CPU memory to hold the full PyTorch pipeline during tracing.
+- VAE encoder export is included in the export spec but the WAN pipeline does not
+  use it during text-to-video inference; it is exported as a no-op placeholder
+  when the submodule exists on the VAE.
