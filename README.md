@@ -15,13 +15,252 @@ installation.
 
 ---
 
-## Why
+## Installation
 
-| Standard Optimum export | Inference-driven export |
+```bash
+pip install torch transformers onnx onnxruntime
+pip install "optimum @ git+https://github.com/huggingface/optimum"
+
+# clone this repo so that `inference_driven_model_compiler` is importable
+git clone https://github.com/naomili0924/inference_driven_model_compiler.git
+export PYTHONPATH=/path/to/parent_of_repo:$PYTHONPATH
+```
+
+---
+
+## CLI export
+
+The `idmc` CLI wraps `optimum-cli export onnx` and adds three new flags:
+
+| Flag | Description |
 |---|---|
-| Needs a hand-written `OnnxConfig` per architecture | Works with any model that runs a forward pass |
-| Dynamic axes declared manually | Dynamic axes inferred from multiple varied runs |
-| New architectures require code changes upstream | New architectures work out of the box |
+| `--export_by_inference` | Enable inference-driven export (traces the model instead of using a hand-written `OnnxConfig`). |
+| `--module_fixed_axis_fields` | JSON dict mapping submodule names to config field names whose values should be treated as **static** tensor dimensions. |
+| `--inference_kwargs` | JSON dict of inputs used to trace the model (overrides the auto-generated dummy inputs). |
+
+### Encoder model
+
+```bash
+idmc export onnx \
+    --model sentence-transformers/paraphrase-MiniLM-L12-v2 \
+    /dev/shm/paraphrase-MiniLM \
+    --export_by_inference=true \
+    --module_fixed_axis_fields='{"transformer": ["hidden_size","intermediate_size","type_vocab_size","vocab_size"]}'
+```
+
+### Decoder model (with KV cache)
+
+```bash
+idmc export onnx \
+    --model google/gemma-4-E2B-it \
+    /dev/shm/gemma-4-E2B-it \
+    --task text-generation-with-past \
+    --export_by_inference=true \
+    --dtype fp16
+```
+
+`--module_fixed_axis_fields` is optional for decoder models — the dynamic-axis
+inference step figures out `num_heads`, `head_dim`, etc. automatically.
+
+> **Tip for large models:** if your disk is limited, export to `/dev/shm` (a
+> RAM-backed tmpfs typically >= 80 GB on GPU instances) and copy the result
+> elsewhere afterwards.
+
+---
+
+## Python API
+
+### Encoder model (BERT feature extraction)
+
+```python
+from transformers import AutoTokenizer
+from inference_driven_model_compiler.optimum.onnxruntime import (
+    OnTheFlyORTModelForFeatureExtraction,
+)
+
+ckpt = "bert-base-uncased"
+tokenizer = AutoTokenizer.from_pretrained(ckpt)
+encoded = tokenizer("ONNX Runtime accelerates inference.", return_tensors="pt")
+
+model = OnTheFlyORTModelForFeatureExtraction.from_pretrained(
+    ckpt,
+    inference_kwargs=dict(encoded),
+    export_by_inference=True,
+    export=True,
+    module_fixed_axis_fields={"transformer": ["hidden_size", "num_attention_heads"]},
+)
+
+out = model(**encoded)
+print(out.last_hidden_state.shape)      # (1, seq_len, 768)
+```
+
+### Decoder model (GPT-2 text generation, with KV cache)
+
+```python
+from transformers import GPT2Tokenizer
+from inference_driven_model_compiler.optimum.onnxruntime import OnTheFlyORTModelForCausalLM
+
+ckpt = "gpt2"
+tokenizer = GPT2Tokenizer.from_pretrained(ckpt)
+encoded = tokenizer("Replace me by any text you'd like.", return_tensors="pt")
+
+model = OnTheFlyORTModelForCausalLM.from_pretrained(
+    ckpt,
+    inference_kwargs=dict(encoded),
+    export_by_inference=True,
+    export=True,
+    module_fixed_axis_fields={"transformer": ["n_ctx", "n_embd"]},
+)
+
+output_ids = model.generate(**encoded)
+print(tokenizer.decode(output_ids[0]))
+```
+
+### Diffusion pipeline (text-to-video)
+
+Pass `export_by_inference=True` together with `inference_kwargs` (the same kwargs
+you would pass to the pipeline `__call__`). The pipeline runs once in PyTorch to
+capture real tensor shapes for every submodule, then exports each one to ONNX
+automatically — no hand-written `OnnxConfig` required.
+
+```python
+import torch
+from inference_driven_model_compiler.optimum.onnxruntime import ORTDiffusionPipeline
+
+inf_kwargs = {
+    "prompt": "A cat walks on the grass, realistic",
+    "negative_prompt": "low quality, blurred",
+    "height": 240,
+    "width": 416,
+    "num_frames": 21,
+    "guidance_scale": 5.0,
+}
+
+pipe = ORTDiffusionPipeline.from_pretrained(
+    "Wan-AI/Wan2.1-T2V-1.3B-Diffusers",
+    provider="CUDAExecutionProvider",
+    torch_dtype=torch.float16,
+    export_by_inference=True,
+    inference_kwargs=inf_kwargs,
+    module_fixed_axis_fields={
+        "text_encoder": ["d_model", "vocab_size"],
+        "transformer":  ["in_channels", "text_dim"],
+        "vae_decoder":  ["base_dim", "z_dim"],
+    },
+)
+
+output = pipe(**inf_kwargs).frames[0]
+```
+
+This exports three ONNX files to a temporary directory and immediately loads them
+into ORT sessions — all in one `from_pretrained` call:
+
+| Submodule | ONNX file | Typical size |
+|---|---|---|
+| `text_encoder` | `text_encoder/model.onnx` | ~13 GB (fp16) |
+| `transformer` | `transformer/model.onnx` | ~3 GB (fp16) |
+| `vae_decoder` | `vae_decoder/model.onnx` | ~137 MB (fp16) |
+
+### Loading pre-exported ONNX weights
+
+```python
+pipe = ORTDiffusionPipeline.from_pretrained(
+    "optimum/stable-diffusion-v1-5",   # Hub repo with pre-exported ONNX weights
+    export=False,
+)
+```
+
+### Common arguments
+
+| Argument | Meaning |
+|---|---|
+| `inference_kwargs` | Inputs used to trace the model (e.g. a tokenized prompt, or full pipeline kwargs for diffusion). |
+| `export_by_inference=True` | Enable the inference-driven export path. |
+| `export=True` | Force a fresh ONNX export (transformer models). |
+| `module_fixed_axis_fields` | Per-submodule config field names whose values should be treated as fixed (static) tensor dims. |
+| `skip_random_generation` | Keep the actual traced tensors as fixed dummy inputs instead of regenerating them. |
+| `n_trials` | Number of inference passes for dynamic-axis detection, transformer models only (default `3`). |
+
+---
+
+## Available classes
+
+All live in `inference_driven_model_compiler.optimum.onnxruntime` and share the
+same `from_pretrained(...)` interface:
+
+### Transformer models
+
+| Class | Task |
+|---|---|
+| `OnTheFlyORTModelForCausalLM` | Text generation (decoder-only, KV cache) |
+| `OnTheFlyORTModelForFeatureExtraction` | Embeddings / hidden states |
+| `OnTheFlyORTModelForMaskedLM` | Masked language modeling |
+| `OnTheFlyORTModelForSequenceClassification` | Sequence classification |
+| `OnTheFlyORTModelForTokenClassification` | Token classification / NER |
+| `OnTheFlyORTModelForQuestionAnswering` | Extractive QA |
+
+### Diffusion pipelines
+
+| Class | Purpose |
+|---|---|
+| `ORTDiffusionPipeline` | Generic base — wraps **any** `diffusers.DiffusionPipeline` |
+| `ORTUnet` | ORT session wrapper for a UNet2D/3D denoiser |
+| `ORTTransformer` | ORT session wrapper for a DiT/transformer denoiser |
+| `ORTTextEncoder` | ORT session wrapper for a text encoder |
+| `ORTVaeEncoder` | ORT session wrapper for a VAE encoder |
+| `ORTVaeDecoder` | ORT session wrapper for a VAE decoder |
+| `ORTVae` | Combines `ORTVaeEncoder` + `ORTVaeDecoder` behind the standard `vae` API |
+
+`ORTDiffusionPipeline` requires no model-specific subclass. When called as the
+base class it reads `_class_name` from the model's `model_index.json` and creates
+an `ORT<ClassName>` wrapper on the fly via `_make_ort_pipeline_class`. Every
+diffusers pipeline — including ones not yet written — is handled automatically.
+
+Supported text-to-video pipeline names (as of diffusers 0.38):
+`AnimateDiffPipeline`, `AnimateDiffSDXLPipeline`, `CogVideoXPipeline`,
+`HunyuanVideo15Pipeline`, `HunyuanVideoPipeline`, `LTXPipeline`, `LTX2Pipeline`,
+`LattePipeline`, `MochiPipeline`, `SanaVideoPipeline`, `TextToVideoSDPipeline`,
+`WanPipeline`, `WanAnimatePipeline`.
+
+---
+
+## Verified models
+
+### Transformer models
+
+| Model | Type | Task tested |
+|---|---|---|
+| GPT-2 | decoder-only | text generation (KV cache) |
+| Gemma 4 (2B) | decoder-only | text generation (KV cache, fp16) |
+| BERT-base | encoder | masked-LM, seq-cls, token-cls, QA, feature extraction |
+| Sentence-Transformers / paraphrase-MiniLM-L12-v2 | encoder | feature extraction |
+| T5-small | encoder-decoder | feature extraction (encoder) |
+| BART-base | encoder-decoder | feature extraction (encoder) |
+| ViT-base | vision encoder | feature extraction |
+| CLIP-ViT-base | vision encoder | feature extraction |
+| Whisper-tiny | audio encoder | feature extraction |
+
+### Diffusion pipelines
+
+| Model | Pipeline | Submodules exported | Notes |
+|---|---|---|---|
+| Wan2.1-T2V-1.3B | `WanPipeline` | text_encoder, transformer, vae_decoder | Verified end-to-end on CUDA; 50-step inference at ~7.4 it/s |
+
+---
+
+## Limitations
+
+- Encoder-decoder models (T5, BART, Whisper) are exported **encoder-only** for
+  feature-extraction; full encoder-decoder generation is not yet wired up.
+- CLIP exports the **vision encoder** (the full CLIP forward needs both text and
+  image inputs and returns embeddings rather than `last_hidden_state`).
+- The exported ONNX is written to a temporary directory; call
+  `model.save_pretrained(...)` to persist it.
+- Diffusion pipeline export runs one full inference pass before exporting, which
+  requires enough GPU/CPU memory to hold the full PyTorch pipeline during tracing.
+- VAE encoder export is included in the export spec but the WAN pipeline does not
+  use it during text-to-video inference; it is exported as a no-op placeholder
+  when the submodule exists on the VAE.
 
 ---
 
@@ -95,284 +334,24 @@ everything else — `hidden_size`, `num_attention_heads`, `head_dim`,
 `vocab_size`, image height/width, ViT patch count, etc. — is correctly kept
 static.
 
----
+For each tensor seen across the trial runs:
 
-## Installation
-
-```bash
-pip install torch transformers onnx onnxruntime
-pip install "optimum @ git+https://github.com/huggingface/optimum"
-
-# clone this repo so that `inference_driven_model_compiler` is importable
-git clone https://github.com/naomili0924/inference_driven_model_compiler.git
-export PYTHONPATH=/path/to/parent_of_repo:$PYTHONPATH
-```
+- **Dimension 0** → always dynamic (`batch`).
+- **Any other dimension** → dynamic **iff** its size differed between at least
+  two trials; otherwise static.
+- For decoder KV-cache tensors `past_key_values.{i}.key/value`, the
+  past-sequence dimension (axis 2) is dynamic while `num_heads` (axis 1) and
+  `head_dim` (axis 3) stay static.
 
 ---
 
-## Quick start
+## Why
 
-### Encoder model (BERT feature extraction)
-
-```python
-from transformers import AutoTokenizer
-from inference_driven_model_compiler.optimum.onnxruntime import (
-    OnTheFlyORTModelForFeatureExtraction,
-)
-
-ckpt = "bert-base-uncased"
-tokenizer = AutoTokenizer.from_pretrained(ckpt)
-encoded = tokenizer("ONNX Runtime accelerates inference.", return_tensors="pt")
-
-model = OnTheFlyORTModelForFeatureExtraction.from_pretrained(
-    ckpt,
-    inference_kwargs=dict(encoded),     # the inputs to trace
-    export_by_inference=True,
-    export=True,
-    module_fixed_axis_fields={"transformer": ["hidden_size", "num_attention_heads"]},
-)
-
-out = model(**encoded)
-print(out.last_hidden_state.shape)      # (1, seq_len, 768)
-```
-
-### Decoder model (GPT-2 text generation, with KV cache)
-
-```python
-from transformers import GPT2Tokenizer
-from inference_driven_model_compiler.optimum.onnxruntime import OnTheFlyORTModelForCausalLM
-
-ckpt = "gpt2"
-tokenizer = GPT2Tokenizer.from_pretrained(ckpt)
-encoded = tokenizer("Replace me by any text you'd like.", return_tensors="pt")
-
-model = OnTheFlyORTModelForCausalLM.from_pretrained(
-    ckpt,
-    inference_kwargs=dict(encoded),
-    export_by_inference=True,
-    export=True,
-    module_fixed_axis_fields={"transformer": ["n_ctx", "n_embd"]},
-)
-
-output_ids = model.generate(**encoded)
-print(tokenizer.decode(output_ids[0]))
-```
-
-### Common arguments
-
-| Argument | Meaning |
+| Standard Optimum export | Inference-driven export |
 |---|---|
-| `inference_kwargs` | The inputs used to trace the model (e.g. a tokenized prompt, or full pipeline kwargs for diffusion). |
-| `export_by_inference=True` | Enable the inference-driven export path. |
-| `export=True` | Force a static ONNX export using Optimum's standard path (transformer models only). |
-| `module_fixed_axis_fields` | Per-submodule config field names whose values should be treated as fixed (static) tensor dims. |
-| `skip_random_generation` | Keep the actual traced tensors as fixed dummy inputs instead of regenerating them. |
-| `n_trials` | Number of inference passes for dynamic-axis detection, transformer models only (default `3`). |
-
----
-
-## Available classes
-
-All live in `inference_driven_model_compiler.optimum.onnxruntime` and share the
-same `from_pretrained(...)` interface:
-
-### Transformer models
-
-| Class | Task |
-|---|---|
-| `OnTheFlyORTModelForCausalLM` | Text generation (decoder-only, KV cache) |
-| `OnTheFlyORTModelForFeatureExtraction` | Embeddings / hidden states |
-| `OnTheFlyORTModelForMaskedLM` | Masked language modeling |
-| `OnTheFlyORTModelForSequenceClassification` | Sequence classification |
-| `OnTheFlyORTModelForTokenClassification` | Token classification / NER |
-| `OnTheFlyORTModelForQuestionAnswering` | Extractive QA |
-
-### Diffusion pipelines
-
-| Class | Purpose |
-|---|---|
-| `ORTDiffusionPipeline` | Generic base — wraps **any** `diffusers.DiffusionPipeline` |
-| `ORTUnet` | ORT session wrapper for a UNet2D/3D denoiser |
-| `ORTTransformer` | ORT session wrapper for a DiT/transformer denoiser |
-| `ORTTextEncoder` | ORT session wrapper for a text encoder |
-| `ORTVaeEncoder` | ORT session wrapper for a VAE encoder |
-| `ORTVaeDecoder` | ORT session wrapper for a VAE decoder |
-| `ORTVae` | Combines `ORTVaeEncoder` + `ORTVaeDecoder` behind the standard `vae` API |
-
-`ORTDiffusionPipeline` requires no model-specific subclass. When called as the
-base class it reads `_class_name` from the model's `model_index.json` and creates
-an `ORT<ClassName>` wrapper on the fly via `_make_ort_pipeline_class`. Every
-diffusers pipeline — including ones not yet written — is handled automatically.
-
-#### Inference-driven export (recommended)
-
-Pass `export_by_inference=True` together with `inference_kwargs` (the same kwargs
-you would pass to the pipeline `__call__`). The pipeline runs once in PyTorch to
-capture real tensor shapes for every submodule, then exports each one to ONNX
-automatically — no hand-written `OnnxConfig` required.
-
-```python
-import torch
-from inference_driven_model_compiler.optimum.onnxruntime import ORTDiffusionPipeline
-
-inf_kwargs = {
-    "prompt": "A cat walks on the grass, realistic",
-    "negative_prompt": "low quality, blurred",
-    "height": 240,
-    "width": 416,
-    "num_frames": 21,
-    "guidance_scale": 5.0,
-}
-
-pipe = ORTDiffusionPipeline.from_pretrained(
-    "Wan-AI/Wan2.1-T2V-1.3B-Diffusers",
-    provider="CUDAExecutionProvider",
-    torch_dtype=torch.float16,
-    export_by_inference=True,
-    inference_kwargs=inf_kwargs,
-    module_fixed_axis_fields={
-        "text_encoder": ["d_model", "vocab_size"],
-        "transformer":  ["in_channels", "text_dim"],
-        "vae_decoder":  ["base_dim", "z_dim"],
-    },
-)
-
-output = pipe(**inf_kwargs).frames[0]
-```
-
-This exports three ONNX files to a temporary directory and immediately loads them
-into ORT sessions — all in one `from_pretrained` call. The exported files are:
-
-| Submodule | ONNX file | Typical size |
-|---|---|---|
-| `text_encoder` | `text_encoder/model.onnx` | ~13 GB (fp16) |
-| `transformer` | `transformer/model.onnx` | ~3 GB (fp16) |
-| `vae_decoder` | `vae_decoder/model.onnx` | ~137 MB (fp16) |
-
-#### Loading pre-exported ONNX weights
-
-For a pipeline that is already exported (or downloaded from the Hub with ONNX
-weights):
-
-```python
-pipe = ORTDiffusionPipeline.from_pretrained(
-    "optimum/stable-diffusion-v1-5",   # Hub repo with pre-exported ONNX weights
-    export=False,
-)
-```
-
-#### Text-to-video pipelines
-
-Every text-to-video pipeline in `diffusers` works without any new code — just
-swap in the model ID and matching `inference_kwargs`:
-
-```python
-# Wan2.1 T2V 1.3B (verified end-to-end)
-pipe = ORTDiffusionPipeline.from_pretrained(
-    "Wan-AI/Wan2.1-T2V-1.3B-Diffusers",
-    export_by_inference=True, inference_kwargs=inf_kwargs, ...
-)
-
-# CogVideoX — no ORTCogVideoXPipeline class needed
-pipe = ORTDiffusionPipeline.from_pretrained(
-    "THUDM/CogVideoX-2b",
-    export_by_inference=True, inference_kwargs=inf_kwargs, ...
-)
-
-# HunyuanVideo
-pipe = ORTDiffusionPipeline.from_pretrained(
-    "tencent/HunyuanVideo",
-    export_by_inference=True, inference_kwargs=inf_kwargs, ...
-)
-```
-
-The complete list of supported text-to-video pipeline names (as of diffusers 0.38):
-`AnimateDiffPipeline`, `AnimateDiffSDXLPipeline`, `CogVideoXPipeline`,
-`HunyuanVideo15Pipeline`, `HunyuanVideoPipeline`, `LTXPipeline`, `LTX2Pipeline`,
-`LattePipeline`, `MochiPipeline`, `SanaVideoPipeline`, `TextToVideoSDPipeline`,
-`WanPipeline`, `WanAnimatePipeline`.
-
-#### Implementation notes
-
-- **VAE decoder**: WAN's VAE decodes per-frame with a `feat_cache` in PyTorch.
-  For ONNX, `post_quant_conv + decoder` are fused into a single
-  `_VaeFullDecodeWrapper` that processes the full latent video in one call.
-- **Text encoder constant folding**: disabled by default for text encoders to
-  avoid ONNX models inflating from ~13 GB to ~89 GB due to precomputed
-  relative-position attention bias tensors.
-- **`_upsample_nearest_exact2d`**: a custom ONNX symbolic is registered for this
-  ATen op (used by `nn.Upsample(mode='nearest-exact')` in the WAN VAE), mapping
-  it to the ONNX `Resize` op.
-
----
-
-## Verified models
-
-### Transformer models
-
-| Model | Type | Task tested |
-|---|---|---|
-| GPT-2 | decoder-only | text generation (KV cache) |
-| BERT-base | encoder | masked-LM, seq-cls, token-cls, QA, feature extraction |
-| T5-small | encoder-decoder | feature extraction (encoder) |
-| BART-base | encoder-decoder | feature extraction (encoder) |
-| ViT-base | vision encoder | feature extraction |
-| CLIP-ViT-base | vision encoder | feature extraction |
-| Whisper-tiny | audio encoder | feature extraction |
-
-### Diffusion pipelines
-
-| Model | Pipeline | Submodules exported | Notes |
-|---|---|---|---|
-| Wan2.1-T2V-1.3B | `WanPipeline` | text_encoder, transformer, vae_decoder | Verified end-to-end on CUDA; 50-step inference at ~7.4 it/s |
-
----
-
-## Tests
-
-```bash
-cd /workspace   # must be the parent of the repo — avoids optimum/ shadowing
-
-# Run all tests (14 transformer tests + 1 diffusion test suite)
-bash inference_driven_model_compiler/run_tests.sh
-
-# Run a single file
-TESTS="bert_feature_extraction.py" bash inference_driven_model_compiler/run_tests.sh
-
-# Set timeout per test (default 600 s)
-TIMEOUT=120 bash inference_driven_model_compiler/run_tests.sh
-```
-
-### Transformer model tests (`on_the_fly_pipeline_tests/`)
-
-| File | What it tests |
-|---|---|
-| `bert_feature_extraction.py` | BERT encoder → feature extraction |
-| `bert_masked_lm.py` | BERT masked-LM |
-| `bert_sequence_classification.py` | BERT sequence classification |
-| `bert_token_classification.py` | BERT NER |
-| `bert_qa.py` | BERT extractive QA |
-| `gpt2_text_generation.py` | GPT-2 text generation with KV cache |
-| `t5_feature_extraction.py` | T5 encoder feature extraction |
-| `bart_feature_extraction.py` | BART encoder feature extraction |
-| `vit_feature_extraction.py` | ViT vision encoder |
-| `clip_feature_extraction.py` | CLIP vision encoder |
-| `whisper_feature_extraction.py` | Whisper audio encoder |
-| `sentence_transformer_feature_extraction.py` | Sentence-Transformers BERT |
-| `test_dynamic_axes.py` | 140 structural checks: each dim is labelled dynamic/static correctly for BERT, GPT-2, ViT, T5 |
-| `test_dynamic_seq_length.py` | 12 runtime checks: exported ONNX runs at shapes different from the trace |
-
-### Diffusion pipeline tests (`on_the_fly_pipeline_tests/test_diffusion_pipeline.py`)
-
-43 unit tests — no GPU or model download required (all sessions are mocked):
-
-- `TestMakeORTPipelineClass` — `_make_ort_pipeline_class` for each of the 13 text-to-video pipelines
-- `TestDynamicClassCoverage` — future pipelines, MRO order, no missing pipeline names
-- `TestTextToVideoPipelineClasses` — explicit per-pipeline regression guard
-- `TestFromPretrainedMocked` — `from_pretrained` class-selection, subclass identity, unknown-name error
-- `TestSubmoduleForward` — `ORTTransformer`, `ORTTextEncoder`, `ORTVaeEncoder`, `ORTVaeDecoder`, `ORTUnet` forward with mocked sessions
-- `TestIOBindingWiring` — `set_io_binding_file`, `load_shapes_as_torch_size`
-- `TestORTVae` — encode/decode, encoder-only, decoder-only
+| Needs a hand-written `OnnxConfig` per architecture | Works with any model that runs a forward pass |
+| Dynamic axes declared manually | Dynamic axes inferred from multiple varied runs |
+| New architectures require code changes upstream | New architectures work out of the box |
 
 ---
 
@@ -380,6 +359,7 @@ TIMEOUT=120 bash inference_driven_model_compiler/run_tests.sh
 
 ```
 inference_driven_model_compiler/
+├── cli.py                        # idmc CLI — wraps optimum-cli with extra flags
 ├── optimum/
 │   ├── exporters/onnx/
 │   │   ├── utils.py              # trace_model_shapes(), dynamic-axis inference
@@ -391,40 +371,5 @@ inference_driven_model_compiler/
 │       ├── modeling_decoder.py   # OnTheFlyORTModelForCausalLM
 │       ├── modeling_diffusion.py # ORTDiffusionPipeline + submodule wrappers
 │       └── utils.py              # load_shapes_as_torch_size and helpers
-├── on_the_fly_pipeline_tests/    # per-model tests + dynamic-axis + diffusion suites
-├── baseline_pipeline_tests/      # plain Optimum baselines for comparison
-└── run_tests.sh                  # test runner (run from /workspace)
+└── on_the_fly_pipeline_tests/    # per-model tests + dynamic-axis + diffusion suites
 ```
-
----
-
-## How dynamic vs. static axes are decided
-
-For each tensor seen across the trial runs:
-
-- **Dimension 0** → always dynamic (`batch`).
-- **Any other dimension** → dynamic **iff** its size differed between at least
-  two trials; otherwise static.
-- For decoder KV-cache tensors `past_key_values.{i}.key/value`, the
-  past-sequence dimension (axis 2) is dynamic while `num_heads` (axis 1) and
-  `head_dim` (axis 3) stay static.
-
-This means architecture constants pulled from `model.config`
-(`hidden_size`, `vocab_size`, `num_attention_heads`, image resolution, …) are
-never accidentally exported as dynamic.
-
----
-
-## Limitations
-
-- Encoder-decoder models (T5, BART, Whisper) are exported **encoder-only** for
-  feature-extraction; full encoder-decoder generation is not yet wired up.
-- CLIP exports the **vision encoder** (the full CLIP forward needs both text and
-  image inputs and returns embeddings rather than `last_hidden_state`).
-- The exported ONNX is written to a temporary directory; call
-  `model.save_pretrained(...)` to persist it.
-- Diffusion pipeline export runs one full inference pass before exporting, which
-  requires enough GPU/CPU memory to hold the full PyTorch pipeline during tracing.
-- VAE encoder export is included in the export spec but the WAN pipeline does not
-  use it during text-to-video inference; it is exported as a no-op placeholder
-  when the submodule exists on the VAE.
