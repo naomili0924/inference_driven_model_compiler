@@ -788,9 +788,15 @@ def _get_submodels_and_tensors_(
                 dummy_outputs["transformer"]["logits"] = tuple(decode_output.logits.shape)
             updated_pkv = getattr(decode_output, "past_key_values", None)
             if updated_pkv is not None:
+                # ONNX convention: KV-cache *inputs* are named "past_key_values.*"
+                # while the updated KV-cache *outputs* are named "present.*". Using
+                # distinct names avoids an input/output name collision (which makes
+                # torch.onnx append a ".1" suffix to the inputs) and matches what
+                # optimum's validation expects (it renames the PyTorch reference's
+                # "past_key_values" output to "present" before comparing).
                 for i, k, v in _iter_pkv(updated_pkv):
-                    dummy_outputs["transformer"][f"past_key_values.{i}.key"] = tuple(k.shape)
-                    dummy_outputs["transformer"][f"past_key_values.{i}.value"] = tuple(v.shape)
+                    dummy_outputs["transformer"][f"present.{i}.key"] = tuple(k.shape)
+                    dummy_outputs["transformer"][f"present.{i}.value"] = tuple(v.shape)
         else:
             # No KV cache: original single-step behaviour + position_ids
             for key, val in prefill_kwargs.items():

@@ -128,6 +128,25 @@ class DummyOnnxConfig(OnnxConfig):
     def _is_kv(name: str) -> bool:
         return bool(re.match(r"^(past_key_values|present)\.\d+\.(key|value)$", name))
 
+    def flatten_output_collection_property(self, name: str, field):
+        """Flatten KV-cache collections using optimum's ``.key``/``.value`` naming.
+
+        The base ``OnnxConfig`` flattens a tuple-of-tuples generically into
+        ``{name}.0``, ``{name}.1``, … which does not match the exported graph's
+        ``past_key_values.{i}.key`` / ``present.{i}.value`` input/output names.
+        During validation optimum flattens both the reference inputs
+        (``past_key_values``) and the reference outputs (``present``) with this
+        method, so emitting the per-layer key/value names here makes the feed and
+        the output-name comparison line up with the actual ONNX graph.
+        """
+        if name in ("present", "past_key_values"):
+            flattened = {}
+            for idx, t in enumerate(field):
+                flattened[f"{name}.{idx}.key"] = t[0]
+                flattened[f"{name}.{idx}.value"] = t[1]
+            return flattened
+        return super().flatten_output_collection_property(name, field)
+
     def _axes_for(self, name: str, shape: tuple) -> dict[int, str]:
         """Return dynamic-axes dict for one tensor.
 
