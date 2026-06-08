@@ -461,6 +461,18 @@ def get_dynamic_model_for_export(
     float_dtype: str = "fp32"
 ):
     DummyOnnxConfig = _get_dummy_onnx_config()
+
+    # For encoder-decoder models we traced (and will export) only the encoder.
+    # Exporting the full model with encoder-only inputs causes the decoder to fail.
+    is_enc_dec = getattr(getattr(model, "config", None), "is_encoder_decoder", False)
+    export_model = model
+    if is_enc_dec:
+        _enc = getattr(model, "encoder", None) or (
+            model.get_encoder() if hasattr(model, "get_encoder") else None
+        )
+        if _enc is not None:
+            export_model = _enc
+
     transformer_config = DummyOnnxConfig(config=model.config,
                                           task="backbone",
                                           preprocessors=None,
@@ -470,7 +482,7 @@ def get_dynamic_model_for_export(
                                           model_outputs=models_and_outputs["transformer"],
                                           config_dim=generate_config_dim(model, (module_fixed_axis_fields or {}).get("transformer", [])))
     models_for_export = {}
-    models_for_export["transformer"] = (model, transformer_config)
+    models_for_export["transformer"] = (export_model, transformer_config)
     return models_for_export
     
 
@@ -585,29 +597,51 @@ def _infer_transformer_kwargs(model) -> dict:
     1. Load the tokenizer from the model's name/path and encode a dummy sentence.
     2. Inspect the model's forward signature and generate random tensors for
        required tensor-typed parameters.
+
+    After either attempt, supplements with modality-specific inputs that the
+    tokenizer alone cannot produce (e.g. `input_features` for audio models like
+    Whisper).
     """
+    import inspect
     model_name = getattr(getattr(model, "config", None), "_name_or_path", None)
+    result = {}
 
     # --- Attempt 1: use the tokenizer ---
     if model_name:
         try:
             from transformers import AutoTokenizer
             tokenizer = AutoTokenizer.from_pretrained(model_name)
-            inputs = tokenizer(
-                "Hello world",
-                return_tensors="pt",
-                padding=True,
-            )
-            return dict(inputs)
+            inputs = tokenizer("Hello world", return_tensors="pt", padding=True)
+            result = dict(inputs)
         except Exception:
             pass
 
-    # --- Attempt 2: inspect forward signature ---
-    import inspect
-    sig = inspect.signature(model.forward)
+    # --- Supplement: audio-primary models (Whisper, etc.) need input_features ---
+    # Only add when input_ids is absent from the forward signature: that means
+    # the model is audio-driven (Whisper). Multimodal models like Gemma 4 also
+    # have input_features in their signature but are text-primary (input_ids is
+    # their required argument) — don't inject audio tensors for those.
+    fwd_params = inspect.signature(model.forward).parameters
+    if ("input_features" in fwd_params
+            and "input_features" not in result
+            and "input_ids" not in fwd_params):
+        cfg = getattr(model, "config", None)
+        num_mel_bins = getattr(cfg, "num_mel_bins", 80)
+        max_src_pos  = getattr(cfg, "max_source_positions", 1500)
+        try:
+            model_dtype = next(model.parameters()).dtype
+        except StopIteration:
+            model_dtype = torch.float32
+        result["input_features"] = torch.zeros(
+            (1, num_mel_bins, max_src_pos * 2), dtype=model_dtype
+        )
+
+    if result:
+        return result
+
+    # --- Attempt 2: inspect forward signature (text models without a tokenizer) ---
     vocab_size = getattr(getattr(model, "config", None), "vocab_size", 32000)
-    result = {}
-    for name, param in sig.parameters.items():
+    for name, param in fwd_params.items():
         if name in ("self", "return_dict", "output_attentions",
                     "output_hidden_states", "labels"):
             continue
@@ -654,6 +688,30 @@ def _get_submodels_and_tensors_(
         # Ensure KV-cache is enabled for the prefill pass when requested
         if use_cache and "use_cache" not in prefill_kwargs:
             prefill_kwargs["use_cache"] = True
+
+        # Encoder-decoder models (T5, BART, Whisper, …): trace the encoder
+        # submodule directly.  Running the full model forward requires both
+        # encoder and decoder inputs and is not needed for encoder-only export.
+        is_enc_dec = getattr(getattr(model, "config", None), "is_encoder_decoder", False)
+        _encoder_mod = (
+            getattr(model, "encoder", None)
+            or (model.get_encoder() if hasattr(model, "get_encoder") else None)
+        )
+        if is_enc_dec and _encoder_mod is not None:
+            import inspect as _enc_inspect
+            enc_sig = set(_enc_inspect.signature(_encoder_mod.forward).parameters)
+            enc_kwargs = {
+                k: v for k, v in prefill_kwargs.items()
+                if k in enc_sig and torch.is_tensor(v)
+            }
+            with torch.no_grad():
+                enc_out = _encoder_mod(**enc_kwargs)
+            for key, val in enc_kwargs.items():
+                dummy_inputs["transformer"][key] = (
+                    val if skip_random_generation else tuple(val.shape)
+                )
+            dummy_outputs["transformer"].update(_flatten_output(enc_out))
+            return dummy_inputs, dummy_outputs
 
         # Prefill forward: no past_key_values, traces all input shapes
         with torch.no_grad():
