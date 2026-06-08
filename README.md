@@ -20,17 +20,30 @@ installation.
 ```bash
 pip install torch transformers onnx onnxruntime
 pip install "optimum @ git+https://github.com/huggingface/optimum"
+# the ONNX exporter/runtime now lives in the separate optimum-onnx package
+pip install "optimum-onnx[onnxruntime] @ git+https://github.com/huggingface/optimum-onnx"
 
-# clone this repo so that `inference_driven_model_compiler` is importable
 git clone https://github.com/naomili0924/inference_driven_model_compiler.git
-export PYTHONPATH=/path/to/parent_of_repo:$PYTHONPATH
+# Put the *repo directory itself* on PYTHONPATH. This activates the shadow
+# `optimum` package, which (a) makes `optimum-cli` use the inference-driven
+# exporter and (b) auto-registers the new export flags onto
+# `optimum-cli export onnx` (see optimum/commands/register/register_idmc.py).
+# Add the parent dir too if you also want `import inference_driven_model_compiler`
+# or the `idmc` CLI.
+export PYTHONPATH=/path/to/inference_driven_model_compiler:$PYTHONPATH
 ```
+
+With this repo *off* PYTHONPATH, `optimum-cli` behaves exactly as stock — the
+integration is inert unless the shadow `optimum` is active.
 
 ---
 
 ## CLI export
 
-The `idmc` CLI wraps `optimum-cli export onnx` and adds three new flags:
+When this repo is on `PYTHONPATH` (see Installation), the standard
+`optimum-cli export onnx` command gains three extra flags — no separate tool or
+launcher needed. They are registered automatically via
+`optimum/commands/register/register_idmc.py`, which optimum-cli auto-discovers:
 
 | Flag | Description |
 |---|---|
@@ -41,7 +54,7 @@ The `idmc` CLI wraps `optimum-cli export onnx` and adds three new flags:
 ### Encoder model
 
 ```bash
-idmc export onnx \
+optimum-cli export onnx \
     --model sentence-transformers/paraphrase-MiniLM-L12-v2 \
     /dev/shm/paraphrase-MiniLM \
     --export_by_inference=true \
@@ -51,13 +64,17 @@ idmc export onnx \
 ### Decoder model (with KV cache)
 
 ```bash
-idmc export onnx \
-    --model google/gemma-4-E2B-it \
-    /dev/shm/gemma-4-E2B-it \
+optimum-cli export onnx \
+    --model Qwen/Qwen3-4B-Thinking-2507 \
+    /dev/shm/qwen3-4b-thinking-onnx \
     --task text-generation-with-past \
     --export_by_inference=true \
-    --dtype fp16
+    --dtype fp16 --device cpu
 ```
+
+> The inference-driven tracer builds its dummy inputs on CPU, so export decoder
+> models with `--device cpu` (a `--device cuda` model would mismatch the
+> CPU-resident traced inputs).
 
 `--module_fixed_axis_fields` is optional for decoder models — the dynamic-axis
 inference step figures out `num_heads`, `head_dim`, etc. automatically.
