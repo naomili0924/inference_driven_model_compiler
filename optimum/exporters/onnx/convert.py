@@ -1,3 +1,22 @@
+from __future__ import annotations
+
+import os
+from pathlib import Path
+from typing import Any, Callable
+
+from optimum.utils import (
+    DEFAULT_DUMMY_SHAPES,
+    ONNX_WEIGHTS_NAME,
+    TORCH_MINIMUM_VERSION,
+    is_diffusers_available,
+    is_onnxslim_available,
+    is_torch_available,
+    is_torch_onnx_support_available,
+    is_torch_version,
+    is_transformers_version,
+    logging,
+)
+
 if is_torch_available():
     import torch
     import torch.nn as nn
@@ -6,8 +25,14 @@ if is_torch_available():
 if is_diffusers_available():
     from diffusers import DiffusionPipeline, ModelMixin
 
+try:
+    from transformers.generation import GenerationMixin
+except ImportError:
+    GenerationMixin = None
+
 from optimum.exporters.onnx.base import OnnxConfig
-from pathlib import Path
+from optimum.exporters.onnx.constants import UNPICKABLE_ARCHS
+from optimum.exporters.error_utils import AtolError, OutputMatchError, ShapeError
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
 
@@ -27,44 +52,62 @@ from optimum.exporters.onnx.utils import (
     recursive_to_device,
 )
 
-from optimum.utils import (
-    DEFAULT_DUMMY_SHAPES,
-    ONNX_WEIGHTS_NAME,
-    TORCH_MINIMUM_VERSION,
-    is_diffusers_available,
-    is_onnxslim_available,
-    is_torch_onnx_support_available,
-    is_torch_version,
-    is_transformers_version,
-    logging,
-)
-
 from optimum.onnx.graph_transformations import check_and_save_model
 from optimum.utils.save_utils import maybe_save_preprocessors
 
+
+def _materialize_inference_kwargs(inference_kwargs: "dict | None", model) -> "dict | None":
+    """Convert empty-list or list-of-ints placeholders in inference_kwargs to actual tensors.
+
+    An empty list `[]` means "auto-generate a dummy tensor for this input name".
+    A non-empty list is interpreted as a plain Python list and converted with torch.tensor().
+    """
+    if inference_kwargs is None:
+        return None
+    import torch
+    vocab_size = getattr(getattr(model, "config", None), "vocab_size", 32000)
+    result = {}
+    for key, val in inference_kwargs.items():
+        if isinstance(val, list) and len(val) == 0:
+            # auto-generate based on field name heuristics
+            if any(s in key for s in ("ids", "tokens", "index", "indices")):
+                result[key] = torch.randint(0, vocab_size, (1, 16))
+            elif "mask" in key:
+                result[key] = torch.ones((1, 16), dtype=torch.long)
+            elif "type" in key:
+                result[key] = torch.zeros((1, 16), dtype=torch.long)
+            else:
+                result[key] = torch.zeros((1, 16), dtype=torch.float32)
+        elif isinstance(val, list):
+            result[key] = torch.tensor(val)
+        else:
+            result[key] = val
+    return result
+
+
 def onnx_export_from_model(
-    model: PreTrainedModel | DiffusionPipeline,
-    output: str | Path,
-    opset: int | None = None,
-    optimize: str | None = None,
+    model: "PreTrainedModel | DiffusionPipeline",
+    output: "str | Path",
+    opset: "int | None" = None,
+    optimize: "str | None" = None,
     monolith: bool = False,
     no_post_process: bool = False,
-    atol: float | None = None,
+    atol: "float | None" = None,
     do_validation: bool = True,
-    model_kwargs: dict[str, Any] | None = None,
-    custom_onnx_configs: dict[str, OnnxConfig] | None = None,
-    fn_get_submodels: Callable | None = None,
+    model_kwargs: "dict[str, Any] | None" = None,
+    custom_onnx_configs: "dict[str, OnnxConfig] | None" = None,
+    fn_get_submodels: "Callable | None" = None,
     _variant: str = "default",
-    preprocessors: list | None = None,
+    preprocessors: "list | None" = None,
     device: str = "cpu",
     no_dynamic_axes: bool = False,
-    task: str | None = None,
+    task: "str | None" = None,
     use_subprocess: bool = False,
     do_constant_folding: bool = True,
     slim: bool = False,
     dynamo: bool = False,
-    inference_kwargs: dict[str,Any] | None = None,
-    module_fixed_axis_fields: dict[str, list[str]] | None = None,
+    inference_kwargs: "dict[str, Any] | None" = None,
+    module_fixed_axis_fields: "dict[str, list[str]] | None" = None,
     export_by_inference: bool = False,
     skip_random_generation: bool = False,
     **kwargs_shapes,
@@ -122,12 +165,26 @@ def onnx_export_from_model(
     if not output.exists():
         output.mkdir(parents=True)
 
+    # When inference-driven export is requested, ensure module_fixed_axis_fields
+    # is at least an empty dict so the inference path is taken in _get_submodels_and_onnx_configs.
+    if export_by_inference and module_fixed_axis_fields is None:
+        module_fixed_axis_fields = {}
+
+    # Convert empty-list placeholders (from CLI) to actual dummy tensors
+    materialized_inference_kwargs = _materialize_inference_kwargs(inference_kwargs, model)
+
     # inference model to trace input and output tensor shape
+    # Note: _get_submodels_and_tensors_ expects inf_kwargs (not inference_kwargs)
     models_and_inputs, models_and_outputs = _get_submodels_and_tensors_(
-        model=model, 
-        inference_kwargs=inference_kwargs,
+        model=model,
+        inf_kwargs=materialized_inference_kwargs,
         skip_random_generation=skip_random_generation,
+        use_cache=task is not None and task.endswith("-with-past"),
     )
+
+    # custom_architecture is False for standard models; only True when user provides
+    # a fully custom OnnxConfig for an architecture not in TasksManager.
+    custom_architecture = False
 
     onnx_config, models_and_onnx_configs = _get_submodels_and_onnx_configs(
         model=model,
@@ -163,7 +220,8 @@ def onnx_export_from_model(
         if is_transformers_version(">=", "4.44.99") and is_transformers_version("<", "4.99"):
             misplaced_generation_parameters = model.config._get_non_default_generation_parameters()
             if (
-                isinstance(model, GenerationMixin)
+                GenerationMixin is not None
+                and isinstance(model, GenerationMixin)
                 and model.can_generate()
                 and len(misplaced_generation_parameters) > 0
             ):
@@ -228,6 +286,9 @@ def onnx_export_from_model(
             f"Exporting the model {model.__class__.__name__} in bfloat16 float dtype. After the export, ONNX Runtime InferenceSession with CPU/CUDA execution provider likely does not implement all operators for the bfloat16 data type, and the loading is likely to fail."
         )
 
+    # Build input_shapes from trailing keyword arguments
+    input_shapes = {k: v for k, v in kwargs_shapes.items()} or None
+
     _, onnx_outputs = export_models(
         models_and_onnx_configs=models_and_onnx_configs,
         opset=opset,
@@ -238,16 +299,14 @@ def onnx_export_from_model(
         dtype=float_dtype,
         no_dynamic_axes=no_dynamic_axes,
         do_constant_folding=do_constant_folding,
-        dynamo=dynamo,
         model_kwargs=model_kwargs,
-        export_by_inference=export_by_inference,
     )
 
     if models_and_outputs is not None:
         import json
         output_dir = os.path.join(output, "io_binding")
         os.makedirs(output_dir, exist_ok=True)
-        
+
         for module_name, dummy_outputs in models_and_outputs.items():
             # convert tuple -> list for json
             serializable = {
@@ -260,7 +319,6 @@ def onnx_export_from_model(
             with open(file_path, "w") as f:
                 json.dump(serializable, f, indent=4)
             print(f"Saved: {file_path}")
-
 
     if optimize is not None:
         from optimum.onnxruntime import AutoOptimizationConfig, ORTOptimizer
@@ -284,7 +342,6 @@ def onnx_export_from_model(
             check_and_save_model(slimmed_model, file_path)
 
     # Optionally post process the obtained ONNX file(s), for example to merge the decoder / decoder with past if any
-    # TODO: treating diffusion separately is quite ugly
     if not no_post_process and library_name != "diffusers":
         try:
             logger.info("Post-processing the exported models...")
@@ -336,5 +393,3 @@ def onnx_export_from_model(
             raise RuntimeError(
                 f"An error occurred during validation, but the model was saved nonetheless at {output.as_posix()}"
             ) from e
-
-

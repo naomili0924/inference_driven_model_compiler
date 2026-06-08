@@ -16,19 +16,36 @@ Pass any additional pipeline kwargs as JSON with --extra-kwargs:
 
     idmc export --model Wan-AI/Wan2.1-T2V-1.3B --output ./wan_onnx \
                 --extra-kwargs '{"guidance_scale": 5.0, "negative_prompt": "blurry"}'
+
+This module also provides IDMCONNXExportCommand, registered with optimum-cli as
+a replacement for the built-in "export onnx" command so that the new
+inference-driven flags are available:
+
+    optimum-cli export onnx \
+        --model sentence-transformers/paraphrase-MiniLM-L12-v2 \
+        /targetdir/paraphrase-MiniLM-L12-v2 \
+        --inference_kwargs='{"input_ids": []}' \
+        --module_fixed_axis_fields='{"transformer": ["hidden_size"]}' \
+        --export_by_inference=true
 """
+
+from __future__ import annotations
 
 import argparse
 import json
 import logging
 import sys
 from pathlib import Path
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from argparse import ArgumentParser
 
 logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# Helpers
+# Helpers (idmc CLI)
 # ---------------------------------------------------------------------------
 
 def _parse_dtype(dtype_str: str):
@@ -44,7 +61,6 @@ def _parse_dtype(dtype_str: str):
 
 
 def _is_diffusion_model(model_id: str) -> bool:
-    """Heuristic: check the model index to decide pipeline type."""
     try:
         from huggingface_hub import hf_hub_download
         import json as _json
@@ -56,7 +72,7 @@ def _is_diffusion_model(model_id: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Export command
+# idmc export command
 # ---------------------------------------------------------------------------
 
 def cmd_export(args):
@@ -64,7 +80,6 @@ def cmd_export(args):
 
     torch_dtype = args.dtype
 
-    # Build inference kwargs for diffusion models
     inf_kwargs = {}
     if args.prompt is not None:
         inf_kwargs["prompt"] = args.prompt
@@ -79,15 +94,11 @@ def cmd_export(args):
     if args.guidance_scale is not None:
         inf_kwargs["guidance_scale"] = args.guidance_scale
     inf_kwargs["num_inference_steps"] = args.num_inference_steps
-    # Merge any extra kwargs
     if args.extra_kwargs:
         inf_kwargs.update(args.extra_kwargs)
 
     output = Path(args.output)
 
-    # -----------------------------------------------------------------------
-    # Diffusion pipeline export
-    # -----------------------------------------------------------------------
     if args.task == "diffusion" or _is_diffusion_model(args.model):
         from inference_driven_model_compiler.optimum.onnxruntime.modeling_diffusion import (
             ORTDiffusionPipeline,
@@ -96,10 +107,6 @@ def cmd_export(args):
         fixed_axes = args.fixed_axes or {}
 
         print(f"Exporting diffusion pipeline '{args.model}' → {output}")
-        print(f"  provider : {args.provider}")
-        print(f"  dtype    : {torch_dtype}")
-        print(f"  inf_kwargs: {inf_kwargs}")
-
         pipe = ORTDiffusionPipeline.from_pretrained(
             args.model,
             provider=args.provider,
@@ -111,26 +118,17 @@ def cmd_export(args):
         )
         print(f"\nExport complete. ORT pipeline loaded on: {pipe.device}")
         print(f"ONNX models saved to: {output.resolve()}")
-
-    # -----------------------------------------------------------------------
-    # Transformer / encoder-only export
-    # -----------------------------------------------------------------------
     else:
         from inference_driven_model_compiler.optimum.onnxruntime.modeling_decoder import (
             OnTheFlyORTModelForCausalLM,
         )
 
-        # Build encoder inference kwargs
         enc_kwargs: dict = {}
         if args.seq_length is not None:
             enc_kwargs["max_length"] = args.seq_length
         enc_kwargs.update(args.extra_kwargs or {})
 
         print(f"Exporting transformer model '{args.model}' → {output}")
-        print(f"  provider  : {args.provider}")
-        print(f"  dtype     : {torch_dtype}")
-        print(f"  enc_kwargs: {enc_kwargs}")
-
         model = OnTheFlyORTModelForCausalLM.from_pretrained(
             args.model,
             provider=args.provider,
@@ -143,7 +141,7 @@ def cmd_export(args):
 
 
 # ---------------------------------------------------------------------------
-# Argument parser
+# idmc argument parser
 # ---------------------------------------------------------------------------
 
 def build_parser() -> argparse.ArgumentParser:
@@ -153,7 +151,6 @@ def build_parser() -> argparse.ArgumentParser:
     )
     sub = parser.add_subparsers(dest="command", required=True)
 
-    # --- export subcommand --------------------------------------------------
     exp = sub.add_parser(
         "export",
         help="Export a model to ONNX via inference-driven tracing.",
@@ -161,13 +158,10 @@ def build_parser() -> argparse.ArgumentParser:
         description=__doc__,
     )
 
-    # Required
     exp.add_argument("--model", required=True,
                      help="HuggingFace model ID or local path.")
     exp.add_argument("--output", required=True,
                      help="Directory to write ONNX models into.")
-
-    # Pipeline control
     exp.add_argument("--task", default="auto",
                      choices=["auto", "diffusion", "text-generation",
                               "text-classification", "feature-extraction"],
@@ -178,54 +172,150 @@ def build_parser() -> argparse.ArgumentParser:
                      metavar="{float16,bfloat16,float32}",
                      help="Torch dtype for the model (default: float16).")
 
-    # Diffusion-specific kwargs
     diff = exp.add_argument_group("diffusion pipeline kwargs")
-    diff.add_argument("--prompt", default=None,
-                      help="Text prompt for the diffusion inference pass.")
-    diff.add_argument("--negative-prompt", default=None,
-                      help="Negative prompt.")
-    diff.add_argument("--height", type=int, default=None,
-                      help="Output video/image height in pixels.")
-    diff.add_argument("--width", type=int, default=None,
-                      help="Output video/image width in pixels.")
-    diff.add_argument("--num-frames", type=int, default=None,
-                      help="Number of video frames.")
-    diff.add_argument("--guidance-scale", type=float, default=None,
-                      help="Classifier-free guidance scale.")
-    diff.add_argument("--num-inference-steps", type=int, default=1,
-                      help="Denoising steps for shape capture (default: 1, keeps export fast).")
+    diff.add_argument("--prompt", default=None)
+    diff.add_argument("--negative-prompt", default=None)
+    diff.add_argument("--height", type=int, default=None)
+    diff.add_argument("--width", type=int, default=None)
+    diff.add_argument("--num-frames", type=int, default=None)
+    diff.add_argument("--guidance-scale", type=float, default=None)
+    diff.add_argument("--num-inference-steps", type=int, default=1)
 
-    # Transformer-specific kwargs
     enc = exp.add_argument_group("transformer / encoder kwargs")
-    enc.add_argument("--seq-length", type=int, default=None,
-                     help="Sequence length for encoder models.")
+    enc.add_argument("--seq-length", type=int, default=None)
 
-    # Advanced
     adv = exp.add_argument_group("advanced")
-    adv.add_argument(
-        "--fixed-axes",
-        type=json.loads,
-        default=None,
-        metavar="JSON",
-        help=(
-            'JSON dict of {module: [field, ...]} whose config dimensions should be '
-            'kept static. E.g. \'{"transformer": ["hidden_size"]}\''
-        ),
-    )
-    adv.add_argument(
-        "--extra-kwargs",
-        type=json.loads,
-        default=None,
-        metavar="JSON",
-        help="Extra pipeline/model kwargs as a JSON object.",
-    )
+    adv.add_argument("--fixed-axes", type=json.loads, default=None, metavar="JSON")
+    adv.add_argument("--extra-kwargs", type=json.loads, default=None, metavar="JSON")
 
     exp.set_defaults(func=cmd_export)
     return parser
 
 
 # ---------------------------------------------------------------------------
-# Entry point
+# optimum-cli integration: IDMCONNXExportCommand
+# ---------------------------------------------------------------------------
+
+def _parse_bool_arg(val: str) -> bool:
+    if isinstance(val, bool):
+        return val
+    return val.lower() in ("1", "true", "yes")
+
+
+class IDMCONNXExportCommand:
+    """
+    Replacement for optimum's built-in ONNXExportCommand.
+
+    Adds three inference-driven flags on top of all the standard flags:
+      --inference_kwargs       JSON dict, empty list means auto-generate tensor
+      --module_fixed_axis_fields  JSON dict of {module: [config_field, ...]}
+      --export_by_inference    bool flag to enable inference-driven tracing
+    """
+
+    COMMAND = None  # set after import of CommandInfo
+
+    @staticmethod
+    def _setup_command():
+        from optimum.commands.base import BaseOptimumCLICommand, CommandInfo
+        IDMCONNXExportCommand.__bases__ = (BaseOptimumCLICommand,)
+        IDMCONNXExportCommand.COMMAND = CommandInfo(
+            name="onnx",
+            help="Export PyTorch to ONNX (inference-driven)",
+        )
+
+    @staticmethod
+    def parse_args(parser: "ArgumentParser"):
+        from optimum.commands.export.onnx import parse_args_onnx
+        parse_args_onnx(parser)
+
+        idmc_group = parser.add_argument_group("Inference-driven export (IDMC)")
+        idmc_group.add_argument(
+            "--inference_kwargs",
+            type=json.loads,
+            default=None,
+            metavar="JSON",
+            help=(
+                "JSON dict of model inputs for tracing. "
+                "An empty list [] means auto-generate a dummy tensor for that input. "
+                "Example: '{\"input_ids\": [], \"attention_mask\": []}'"
+            ),
+        )
+        idmc_group.add_argument(
+            "--module_fixed_axis_fields",
+            type=json.loads,
+            default=None,
+            metavar="JSON",
+            help=(
+                "JSON dict of {module_name: [config_field, ...]} whose config dimensions "
+                "should be treated as static (non-dynamic) axes. "
+                "Example: '{\"transformer\": [\"hidden_size\", \"vocab_size\"]}'"
+            ),
+        )
+        idmc_group.add_argument(
+            "--export_by_inference",
+            type=_parse_bool_arg,
+            default=False,
+            metavar="BOOL",
+            help="Enable inference-driven export (default: false).",
+        )
+
+    def run(self):
+        from optimum.utils.input_generators import DEFAULT_DUMMY_SHAPES
+
+        # Build input shapes from standard dummy-shape args
+        input_shapes = {}
+        for input_name in DEFAULT_DUMMY_SHAPES:
+            if hasattr(self.args, input_name):
+                input_shapes[input_name] = getattr(self.args, input_name)
+
+        # Import our inference-driven main_export (not the stock optimum one)
+        from optimum.exporters.onnx.__main__ import main_export
+
+        main_export(
+            model_name_or_path=self.args.model,
+            output=self.args.output,
+            task=self.args.task,
+            opset=self.args.opset,
+            device=self.args.device,
+            dtype=self.args.dtype,
+            optimize=self.args.optimize,
+            monolith=self.args.monolith,
+            no_post_process=self.args.no_post_process,
+            framework=self.args.framework,
+            atol=self.args.atol,
+            cache_dir=self.args.cache_dir,
+            trust_remote_code=self.args.trust_remote_code,
+            pad_token_id=self.args.pad_token_id,
+            use_subprocess=False,
+            _variant=self.args.variant,
+            library_name=self.args.library_name,
+            no_dynamic_axes=self.args.no_dynamic_axes,
+            model_kwargs=self.args.model_kwargs,
+            do_constant_folding=not self.args.no_constant_folding,
+            slim=self.args.slim,
+            dynamo=getattr(self.args, "dynamo", False),
+            inference_kwargs=self.args.inference_kwargs,
+            module_fixed_axis_fields=self.args.module_fixed_axis_fields,
+            export_by_inference=self.args.export_by_inference,
+            **input_shapes,
+        )
+
+
+def _build_idmc_onnx_export_command():
+    """Return IDMCONNXExportCommand as a proper BaseOptimumCLICommand subclass."""
+    from optimum.commands.base import BaseOptimumCLICommand, CommandInfo
+
+    class _IDMCONNXExportCommand(IDMCONNXExportCommand, BaseOptimumCLICommand):
+        COMMAND = CommandInfo(
+            name="onnx",
+            help="Export PyTorch to ONNX (inference-driven)",
+        )
+
+    return _IDMCONNXExportCommand
+
+
+# ---------------------------------------------------------------------------
+# Entry point (idmc CLI)
 # ---------------------------------------------------------------------------
 
 def main():

@@ -1,5 +1,36 @@
 from __future__ import annotations
 
+import importlib.util
+import os
+import sys
+
+# Re-export everything from the real site-packages model_configs so that
+# code that imports from 'optimum.exporters.onnx.model_configs' (like the real
+# package's convert.py) still finds SpeechT5OnnxConfig, BertOnnxConfig, etc.
+def _load_real_model_configs():
+    _key = "_idmc_real_onnx_model_configs"
+    if _key in sys.modules:
+        return sys.modules[_key]
+    for _p in sys.path:
+        if not _p or "inference_driven_model_compiler" in _p:
+            continue
+        _f = os.path.join(_p, "optimum", "exporters", "onnx", "model_configs.py")
+        if os.path.exists(_f):
+            spec = importlib.util.spec_from_file_location(_key, _f)
+            mod = importlib.util.module_from_spec(spec)
+            sys.modules[_key] = mod
+            spec.loader.exec_module(mod)
+            return mod
+    return None
+
+_real = _load_real_model_configs()
+if _real is not None:
+    import types
+    _g = globals()
+    for _name, _val in vars(_real).items():
+        if not _name.startswith("_"):
+            _g[_name] = _val
+
 import re
 from typing import Any
 
@@ -14,6 +45,41 @@ class _AnyNormalizedConfig(NormalizedConfig):
     """Pass-through normalized config that works for any model type."""
 
 
+def _get_compatible_model_patcher():
+    """Return a ModelPatcher that skips SDPA mask registration on transformers>=5.x.
+
+    Optimum's stock ModelPatcher registers sdpa_mask_without_vmap as the SDPA mask
+    function. That function requires cache_position as a positional arg, but newer
+    transformers (>=5.0) no longer passes cache_position to the mask interface —
+    it passes q_length/q_offset instead. Skipping the registration lets the stock
+    sdpa_mask handle tracing correctly.
+    """
+    from optimum.exporters.onnx.model_patcher import ModelPatcher
+    from optimum.utils import is_transformers_version
+
+    if is_transformers_version("<", "5.0"):
+        return ModelPatcher
+
+    class _CompatModelPatcher(ModelPatcher):
+        def __enter__(self):
+            result = super().__enter__()
+            # The parent (ModelPatcher) registered sdpa_mask_without_vmap and
+            # eager_mask_without_vmap, which require cache_position as a positional
+            # arg. Transformers>=5 passes q_length/q_offset instead, so we restore
+            # the compatible originals.
+            try:
+                from transformers.masking_utils import (
+                    ALL_MASK_ATTENTION_FUNCTIONS, sdpa_mask, eager_mask,
+                )
+                ALL_MASK_ATTENTION_FUNCTIONS["sdpa"] = sdpa_mask
+                ALL_MASK_ATTENTION_FUNCTIONS["eager"] = eager_mask
+            except Exception:
+                pass
+            return result
+
+    return _CompatModelPatcher
+
+
 class DummyOnnxConfig(OnnxConfig):
     """ONNX config built entirely from traced inference shapes.
 
@@ -23,6 +89,7 @@ class DummyOnnxConfig(OnnxConfig):
 
     NORMALIZED_CONFIG_CLASS = _AnyNormalizedConfig
     DUMMY_INPUT_GENERATOR_CLASSES = (DummyTupleInputGenerator,)
+    _MODEL_PATCHER = _get_compatible_model_patcher()
 
     def __init__(
         self,

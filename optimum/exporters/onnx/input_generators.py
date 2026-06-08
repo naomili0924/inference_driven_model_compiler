@@ -1,5 +1,34 @@
 from __future__ import annotations
 
+import importlib.util
+import os
+import sys
+
+# Re-export everything from the real site-packages input_generators so that code
+# that imports DummyMoonshineAudioInputGenerator etc. still works.
+def _load_real_input_generators():
+    _key = "_idmc_real_onnx_input_generators"
+    if _key in sys.modules:
+        return sys.modules[_key]
+    for _p in sys.path:
+        if not _p or "inference_driven_model_compiler" in _p:
+            continue
+        _f = os.path.join(_p, "optimum", "exporters", "onnx", "input_generators.py")
+        if os.path.exists(_f):
+            spec = importlib.util.spec_from_file_location(_key, _f)
+            mod = importlib.util.module_from_spec(spec)
+            sys.modules[_key] = mod
+            spec.loader.exec_module(mod)
+            return mod
+    return None
+
+_real_ig = _load_real_input_generators()
+if _real_ig is not None:
+    _g = globals()
+    for _name, _val in vars(_real_ig).items():
+        if not _name.startswith("_"):
+            _g[_name] = _val
+
 import torch
 from optimum.utils.input_generators import DummyInputGenerator
 

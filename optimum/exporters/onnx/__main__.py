@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable
 from huggingface_hub.constants import HUGGINGFACE_HUB_CACHE
@@ -10,6 +12,17 @@ from optimum.utils.import_utils import (
     is_timm_available,
     is_transformers_version,
 )
+
+import torch
+from requests.exceptions import ConnectionError as RequestsConnectionError
+from transformers import AutoConfig, AutoTokenizer
+
+try:
+    from transformers import Mxfp4Config
+except ImportError:
+    Mxfp4Config = None
+
+from optimum.exporters.onnx.constants import SDPA_ARCHS_ONNX_EXPORT_NOT_SUPPORTED
 
 from optimum.utils import logging
 logger = logging.get_logger()
@@ -143,12 +156,20 @@ def main_export(
 
         is_mxfp4 = getattr(config, "quantization_config", {}).get("quant_method", None) == "mxfp4"
         # mxfp4 quantized model will be dequantized to bf16
-        if is_mxfp4 and is_transformers_version(">=", "4.55"):
+        if is_mxfp4 and is_transformers_version(">=", "4.55") and Mxfp4Config is not None:
             torch_dtype = torch.float32 if model_type == "gpt_oss" else torch.bfloat16
             loading_kwargs["quantization_config"] = Mxfp4Config(dequantize=True)
 
         if model_type in SDPA_ARCHS_ONNX_EXPORT_NOT_SUPPORTED and is_transformers_version("<", "4.42"):
             loading_kwargs["attn_implementation"] = "eager"
+
+        # For inference-driven export of model types not in TasksManager, force eager
+        # attention so the masking code doesn't require cache_position during tracing.
+        if export_by_inference and "attn_implementation" not in loading_kwargs:
+            try:
+                TasksManager.get_supported_tasks_for_model_type(model_type, "onnx", library_name="transformers")
+            except KeyError:
+                loading_kwargs["attn_implementation"] = "eager"
 
         # Only eager attention implementation returns attentions
         if model_kwargs is not None and model_kwargs.get("output_attentions", False):
@@ -229,10 +250,12 @@ def main_export(
     if is_mxfp4 and model_type == "gpt_oss":
         model.to(torch.float32)
 
-    if (library_name != "diffusers"
-        and task + "-with-past"
-        in TasksManager.get_supported_tasks_for_model_type(model_type, "onnx", library_name=library_name)
-    ):
+    try:
+        _supported_tasks = TasksManager.get_supported_tasks_for_model_type(model_type, "onnx", library_name=library_name)
+    except KeyError:
+        _supported_tasks = []
+
+    if (library_name != "diffusers" and task + "-with-past" in _supported_tasks):
         # Make -with-past the default if --task was not explicitly specified
         if original_task == "auto" and not monolith:
             task = task + "-with-past"
