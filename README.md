@@ -178,6 +178,52 @@ into ORT sessions — all in one `from_pretrained` call:
 | `transformer` | `transformer/model.onnx` | ~3 GB (fp16) |
 | `vae_decoder` | `vae_decoder/model.onnx` | ~137 MB (fp16) |
 
+### Diffusion pipeline (text-to-image)
+
+The same `export_by_inference=True` path handles UNet-based text-to-image
+pipelines such as **SDXL**. The compiler traces the two CLIP text encoders, the
+UNet (including the pooled `added_cond_kwargs` micro-conditioning), and the VAE
+decoder, then runs the whole pipeline through ONNX Runtime.
+
+```python
+import torch
+from inference_driven_model_compiler.optimum.onnxruntime import ORTDiffusionPipeline
+
+inf_kwargs = {
+    "prompt": "A cinematic photo of a red panda astronaut on the moon",
+    "num_inference_steps": 1,     # SDXL-Turbo is a one-step distilled model
+    "guidance_scale": 0.0,        # no classifier-free guidance
+}
+
+pipe = ORTDiffusionPipeline.from_pretrained(
+    "stabilityai/sdxl-turbo",
+    provider="CUDAExecutionProvider",
+    torch_dtype=torch.float16,
+    export_by_inference=True,
+    inference_kwargs=inf_kwargs,
+)
+
+image = pipe(**inf_kwargs).images[0]
+image.save("sdxl_turbo_output.png")
+```
+
+This exports four ONNX submodules and immediately loads them into ORT sessions:
+
+| Submodule | ONNX file | Typical size |
+|---|---|---|
+| `text_encoder` | `text_encoder/model.onnx` | ~236 MB (fp16) |
+| `text_encoder_2` | `text_encoder_2/model.onnx` | ~1.3 GB (fp16) |
+| `unet` | `unet/model.onnx` (+ `model.onnx_data`) | ~4.8 GB (fp16) |
+| `vae_decoder` | `vae_decoder/model.onnx` | ~190 MB (**fp32**) |
+
+> The SDXL VAE is numerically unstable in fp16 (the diffusers pipeline upcasts it
+> to fp32 via `force_upcast`), so the VAE decoder is exported in **fp32** even when
+> the rest of the pipeline is fp16. The fp16 latents are auto-cast at inference.
+
+> Inference-driven diffusion export traces and exports each submodule on the
+> pipeline's device. Use a CUDA provider for large UNet-based models — exporting
+> an fp16 UNet/VAE on CPU is extremely slow.
+
 ### Loading pre-exported ONNX weights
 
 ```python
@@ -262,6 +308,7 @@ Supported text-to-video pipeline names (as of diffusers 0.38):
 | Model | Pipeline | Submodules exported | Notes |
 |---|---|---|---|
 | Wan2.1-T2V-1.3B | `WanPipeline` | text_encoder, transformer, vae_decoder | Verified end-to-end on CUDA; 50-step inference at ~7.4 it/s |
+| SDXL-Turbo | `StableDiffusionXLPipeline` | text_encoder, text_encoder_2, unet, vae_decoder | Text-to-image; verified end-to-end on CUDA (1-step). VAE decoder exported in fp32. |
 
 ---
 

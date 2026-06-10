@@ -41,7 +41,10 @@ from inference_driven_model_compiler.optimum.onnxruntime.modeling_diffusion impo
     ORTVae,
     ORTUnet,
     _make_ort_pipeline_class,
+    _UnetAddedCondWrapper,
+    _TextEncoderHiddenStatesWrapper,
 )
+from transformers.modeling_outputs import ModelOutput
 
 # ── All text-to-video pipelines currently in diffusers ────────────────────────
 # Source: diffusers 0.38.x — update as diffusers adds new ones.
@@ -579,6 +582,72 @@ class TestORTVae(unittest.TestCase):
         dec.session.run.assert_called_once()
 
 
+# ── Suite 7: SDXL text-to-image export wrappers ───────────────────────────────
+
+class TestSDXLExportWrappers(unittest.TestCase):
+    """The UNet/text-encoder export wrappers used for SDXL-style text-to-image."""
+
+    def test_sdxl_pipeline_class_creation(self):
+        """_make_ort_pipeline_class wraps StableDiffusionXLPipeline."""
+        cls = getattr(diffusers, "StableDiffusionXLPipeline", None)
+        if cls is None:
+            self.skipTest("StableDiffusionXLPipeline not in diffusers")
+        ort = _make_ort_pipeline_class(cls)
+        self.assertEqual(ort.__name__, "ORTStableDiffusionXLPipeline")
+        self.assertTrue(issubclass(ort, ORTDiffusionPipeline))
+        self.assertTrue(issubclass(ort, cls))
+
+    def test_unet_added_cond_wrapper(self):
+        """_UnetAddedCondWrapper rebuilds added_cond_kwargs and names output out_sample."""
+        seen = {}
+
+        class FakeUnet(torch.nn.Module):
+            def forward(self, sample, timestep, encoder_hidden_states,
+                        timestep_cond=None, added_cond_kwargs=None, return_dict=True):
+                seen["added_cond_kwargs"] = added_cond_kwargs
+                seen["return_dict"] = return_dict
+                return (sample + 1,)
+
+        w = _UnetAddedCondWrapper(FakeUnet())
+        sample = torch.zeros(2, 4, 8, 8)
+        text_embeds = torch.zeros(2, 1280)
+        time_ids = torch.zeros(2, 6)
+        out = w(sample=sample, timestep=torch.tensor(1.0),
+                encoder_hidden_states=torch.zeros(2, 77, 2048),
+                text_embeds=text_embeds, time_ids=time_ids)
+        # flattened tensors are reassembled into the nested dict
+        self.assertIn("text_embeds", seen["added_cond_kwargs"])
+        self.assertIn("time_ids", seen["added_cond_kwargs"])
+        self.assertFalse(seen["return_dict"])
+        # output is keyed out_sample (what ORTUnet expects)
+        self.assertEqual(list(out.keys()), ["out_sample"])
+        self.assertTrue(torch.allclose(out["out_sample"], sample + 1))
+
+    def test_text_encoder_hidden_states_wrapper(self):
+        """_TextEncoderHiddenStatesWrapper flattens hidden_states, preserves field order."""
+        class FakeTE(torch.nn.Module):
+            def forward(self, input_ids, attention_mask=None,
+                        output_hidden_states=None, return_dict=True):
+                assert output_hidden_states is True  # wrapper must force this on
+                # mimic CLIPTextModelWithProjection field order: text_embeds first
+                return ModelOutput(
+                    text_embeds=torch.zeros(1, 1280),
+                    last_hidden_state=torch.zeros(1, 77, 1280),
+                    hidden_states=(torch.zeros(1, 77, 1280), torch.ones(1, 77, 1280)),
+                )
+
+        w = _TextEncoderHiddenStatesWrapper(FakeTE())
+        out = w(input_ids=torch.zeros(1, 77, dtype=torch.long))
+        keys = list(out.keys())
+        # native field order preserved → output[0] stays text_embeds
+        self.assertEqual(keys[0], "text_embeds")
+        self.assertIn("last_hidden_state", keys)
+        # hidden_states tuple flattened into per-layer entries
+        self.assertIn("hidden_states.0", keys)
+        self.assertIn("hidden_states.1", keys)
+        self.assertNotIn("hidden_states", keys)
+
+
 # ── main ──────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
@@ -592,6 +661,7 @@ if __name__ == "__main__":
         TestSubmoduleForward,
         TestIOBindingWiring,
         TestORTVae,
+        TestSDXLExportWrappers,
     ]:
         suite.addTests(loader.loadTestsFromTestCase(cls))
 

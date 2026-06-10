@@ -86,12 +86,32 @@ class ORTModelMixin(ORTSessionMixin, ConfigMixin, CacheMixin):
         yield from []
 
 
+class _InFeaturesShim:
+    """Minimal stand-in exposing ``add_embedding.linear_1.in_features``.
+
+    SDXL's ``_get_add_time_ids`` validates the micro-conditioning embedding size
+    against ``self.unet.add_embedding.linear_1.in_features``.  The real Linear
+    layer lives inside the (now ONNX) UNet, so we surface the same integer from
+    the saved config (``projection_class_embeddings_input_dim``).
+    """
+
+    def __init__(self, in_features: int):
+        self.linear_1 = type("_Linear", (), {"in_features": in_features})()
+
+
 class ORTUnet(ORTModelMixin):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
 
         if not hasattr(self.config, "time_cond_proj_dim"):
             self.register_to_config(time_cond_proj_dim=None)
+
+        # SDXL-style UNets carry an "add_embedding" used for micro-conditioning.
+        # The pipeline only inspects its input feature count, which equals the
+        # config's projection_class_embeddings_input_dim.
+        add_embed_dim = getattr(self.config, "projection_class_embeddings_input_dim", None)
+        if add_embed_dim is not None:
+            self.add_embedding = _InFeaturesShim(add_embed_dim)
 
         if len(self.input_shapes["timestep"]) > 0:
             logger.warning(
@@ -312,6 +332,13 @@ class ORTVaeDecoder(ORTModelMixin):
         super().__init__(*args, **kwargs)
         if not hasattr(self.config, "scaling_factor") and hasattr(self.config, "block_out_channels"):
             self.register_to_config(scaling_factor=2 ** (len(self.config.block_out_channels) - 1))
+        # SDXL marks its VAE force_upcast=True so diffusers re-runs the decoder in
+        # fp32. That path dereferences self.vae.post_quant_conv.parameters(), which
+        # the ONNX VAE doesn't expose, and the exported graph already runs at its
+        # native (fp16) precision. Disable upcasting so the pipeline feeds the ONNX
+        # decoder directly.
+        if getattr(self.config, "force_upcast", False):
+            self.register_to_config(force_upcast=False)
         self._cpu_session = None  # lazily created if GPU OOM occurs
 
     def forward(
@@ -408,6 +435,85 @@ def _register_onnx_upsample_symbolics():
         logger.warning(f"Could not register _upsample_nearest_exact2d symbolic: {exc}")
 
 
+class _UnetAddedCondWrapper(torch.nn.Module):
+    """Export wrapper for UNet denoisers that take ``added_cond_kwargs``.
+
+    SDXL-style UNets receive their pooled text embedding and micro-conditioning
+    (``text_embeds`` + ``time_ids``) inside a nested ``added_cond_kwargs`` dict.
+    The inference tracer only forwards *tensor* arguments, so the dict is dropped
+    and the bare UNet call would fail.  This wrapper exposes those tensors as
+    first-class arguments and rebuilds the dict internally, so they become
+    ordinary ONNX inputs named ``text_embeds`` / ``time_ids`` — exactly the names
+    ``ORTUnet.forward`` already feeds back in via ``added_cond_kwargs``.
+
+    The single decoded tensor is returned under the key ``out_sample`` so the
+    exported graph's output name matches what ``ORTUnet.forward`` expects.
+    """
+
+    def __init__(self, unet: torch.nn.Module):
+        super().__init__()
+        self.unet = unet
+
+    def forward(
+        self,
+        sample,
+        timestep,
+        encoder_hidden_states,
+        text_embeds=None,
+        time_ids=None,
+        timestep_cond=None,
+    ):
+        added_cond_kwargs = {}
+        if text_embeds is not None:
+            added_cond_kwargs["text_embeds"] = text_embeds
+        if time_ids is not None:
+            added_cond_kwargs["time_ids"] = time_ids
+        out = self.unet(
+            sample=sample,
+            timestep=timestep,
+            encoder_hidden_states=encoder_hidden_states,
+            timestep_cond=timestep_cond,
+            added_cond_kwargs=added_cond_kwargs or None,
+            return_dict=False,
+        )
+        sample_out = out[0] if isinstance(out, (list, tuple)) else out
+        return {"out_sample": sample_out}
+
+
+class _TextEncoderHiddenStatesWrapper(torch.nn.Module):
+    """Export wrapper that forces ``output_hidden_states=True`` on a text encoder.
+
+    SDXL builds its prompt embedding from the *penultimate* hidden layer of each
+    CLIP text encoder and its pooled embedding from the projection output, so the
+    exported graph must expose every hidden state plus the pooled output — none of
+    which the encoder emits with its default arguments.  The captured outputs are
+    flattened into ``hidden_states.{i}`` entries (the layout ``ORTTextEncoder``
+    reconstructs), and the model's own output field order is preserved so that
+    ``output[0]`` keeps its native meaning (``text_embeds`` for a projection head,
+    ``last_hidden_state`` otherwise).
+    """
+
+    def __init__(self, text_encoder: torch.nn.Module):
+        super().__init__()
+        self.text_encoder = text_encoder
+
+    def forward(self, input_ids, attention_mask=None):
+        out = self.text_encoder(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            output_hidden_states=True,
+            return_dict=True,
+        )
+        result = {}
+        for key, value in out.items():
+            if key == "hidden_states" and isinstance(value, (list, tuple)):
+                for i, hs in enumerate(value):
+                    result[f"hidden_states.{i}"] = hs
+            elif torch.is_tensor(value):
+                result[key] = value
+        return result
+
+
 def _on_the_fly_diffusion_export(
     model_name_or_path,
     output,
@@ -444,7 +550,7 @@ def _on_the_fly_diffusion_export(
     # 2. Collect submodules to export: (name, module, subfolder, config_source)
     vae = getattr(pt_pipeline, "vae", None)
     specs = []
-    _vae_decode_export_overrides: dict[str, torch.nn.Module] = {}
+    _export_overrides: dict[str, torch.nn.Module] = {}
     for name, subfolder in [
         ("text_encoder",   DIFFUSION_MODEL_TEXT_ENCODER_SUBFOLDER),
         ("text_encoder_2", DIFFUSION_MODEL_TEXT_ENCODER_2_SUBFOLDER),
@@ -485,7 +591,7 @@ def _on_the_fly_diffusion_export(
 
             _vae_full_decode = _VaeFullDecodeWrapper(_pqc, _dec)
             specs.append(("vae_decoder", _pqc, DIFFUSION_MODEL_VAE_DECODER_SUBFOLDER, vae))
-            _vae_decode_export_overrides = {"vae_decoder": _vae_full_decode}
+            _export_overrides = {"vae_decoder": _vae_full_decode}
 
         elif _dec is not None:
             # CogVideoX-style: post_quant_conv is None; decoder is called directly
@@ -503,9 +609,9 @@ def _on_the_fly_diffusion_export(
 
             _vae_full_decode = _VaeNoQuantDecodeWrapper(_dec)
             specs.append(("vae_decoder", _dec, DIFFUSION_MODEL_VAE_DECODER_SUBFOLDER, vae))
-            _vae_decode_export_overrides = {"vae_decoder": _vae_full_decode}
+            _export_overrides = {"vae_decoder": _vae_full_decode}
         else:
-            _vae_decode_export_overrides = {}
+            _export_overrides = {}
 
     # 3. Register forward pre-hooks to capture each submodule's first-call inputs.
     # We snapshot (deep-copy) values immediately — some models (e.g. WanDecoder3d)
@@ -554,41 +660,125 @@ def _on_the_fly_diffusion_export(
     for h in hooks:
         h.remove()
 
-    # Move each captured submodule to CPU so ONNX export dummy inputs (always CPU)
-    # match the model device, and so shape-variation trials don't hit device mismatches.
-    def _to_cpu(v):
+    # Keep the captured submodules and tensors on the export device.  Tracing and
+    # torch.onnx.export both run real forward passes, and on CPU fp16 (which the
+    # SDXL VAE decoder and large UNets use) those passes are pathologically slow —
+    # an fp16 export that finishes in seconds on CUDA can take tens of minutes on
+    # CPU.  optimum's export() moves the (CPU-generated) dummy inputs to this same
+    # device, so GPU export is consistent.  Falls back to CPU when device=="cpu".
+    export_device = torch.device(device)
+
+    def _to_dev(v):
         if torch.is_tensor(v):
-            return v.cpu()
+            return v.to(export_device)
         if isinstance(v, list):
-            return [_to_cpu(x) for x in v]
+            return [_to_dev(x) for x in v]
         if isinstance(v, tuple):
-            return tuple(_to_cpu(x) for x in v)
+            return tuple(_to_dev(x) for x in v)
         if isinstance(v, dict):
-            return {k2: _to_cpu(v2) for k2, v2 in v.items()}
+            return {k2: _to_dev(v2) for k2, v2 in v.items()}
         return v
 
     for name, mod, _, _ in specs:
         if name in captured:
-            mod.cpu()
-            captured[name] = {k: _to_cpu(v) for k, v in captured[name].items()}
-    # Also move the full vae_decoder wrapper (which includes pqc + decoder) to CPU
-    for _, wrapper_mod in _vae_decode_export_overrides.items():
-        wrapper_mod.cpu()
+            mod.to(export_device)
+            captured[name] = {k: _to_dev(v) for k, v in captured[name].items()}
+    # Keep the full vae_decoder wrapper (pqc + decoder) on the export device too.
+    for _, wrapper_mod in _export_overrides.items():
+        wrapper_mod.to(export_device)
 
     # Normalize the vae_decoder captured input key to "z" when exported via
     # _VaeNoQuantDecodeWrapper (CogVideoX-style, no post_quant_conv).  The hook
     # names the key after the decoder's first parameter ("sample" for CogVideoX),
     # but the wrapper's forward signature uses "z" so trace_model_shapes must
     # receive {"z": tensor}.
-    if "vae_decoder" in captured and "vae_decoder" in _vae_decode_export_overrides:
-        wrapper = _vae_decode_export_overrides["vae_decoder"]
-        if hasattr(wrapper, "dec") and not hasattr(wrapper, "pqc"):
-            # _VaeNoQuantDecodeWrapper — rename first captured tensor key to "z"
-            cap = captured["vae_decoder"]
-            tensor_keys = [k for k, v in cap.items() if torch.is_tensor(v)]
-            if tensor_keys and tensor_keys[0] != "z":
-                cap["z"] = cap.pop(tensor_keys[0])
-                captured["vae_decoder"] = cap
+    if "vae_decoder" in captured and "vae_decoder" in _export_overrides:
+        wrapper = _export_overrides["vae_decoder"]
+        # The capture hook names the input after the *hooked* module's forward
+        # parameter — e.g. "input" for an nn.Conv2d post_quant_conv (SDXL/SD), or
+        # "sample" for a CogVideoX decoder.  The export wrapper's own forward uses
+        # a different name ("x" for _VaeFullDecodeWrapper, "z" for the no-quant
+        # variant), so rename the captured tensor key to the wrapper's first
+        # parameter — otherwise trace_model_shapes' keyword call raises.
+        wrapper_params = list(inspect.signature(wrapper.forward).parameters)
+        target_key = wrapper_params[0] if wrapper_params else None
+        cap = captured["vae_decoder"]
+        tensor_keys = [k for k, v in cap.items() if torch.is_tensor(v)]
+        if target_key and tensor_keys and tensor_keys[0] != target_key:
+            cap[target_key] = cap.pop(tensor_keys[0])
+            captured["vae_decoder"] = cap
+
+    # 4b. Register export wrappers for UNet-based (SDXL-style) pipelines.
+    #
+    #  • UNet: lift the nested ``added_cond_kwargs`` dict (text_embeds + time_ids)
+    #    into top-level captured tensors so they become first-class ONNX inputs,
+    #    and export through _UnetAddedCondWrapper which rebuilds the dict.
+    #  • Text encoders: export through _TextEncoderHiddenStatesWrapper so the graph
+    #    exposes every hidden state + pooled output (SDXL uses the penultimate
+    #    hidden layer and the pooled projection).
+    _modules_by_name = {name: mod for name, mod, _, _ in specs}
+
+    for unet_name in ("unet",):
+        cap = captured.get(unet_name)
+        if cap is None or unet_name in _export_overrides:
+            continue
+        added = cap.pop("added_cond_kwargs", None)
+        if isinstance(added, dict):
+            for k, v in added.items():
+                if torch.is_tensor(v):
+                    cap[k] = v
+        # Only wrap when the UNet actually consumes added_cond_kwargs; otherwise
+        # the plain UNet export (SD1.x-style) already works.
+        if isinstance(added, dict) and any(torch.is_tensor(v) for v in added.values()):
+            _export_overrides[unet_name] = _UnetAddedCondWrapper(
+                _modules_by_name[unet_name]
+            ).to(export_device)
+
+    for te_name in ("text_encoder", "text_encoder_2", "text_encoder_3"):
+        cap = captured.get(te_name)
+        if cap is None or te_name in _export_overrides:
+            continue
+        # Wrap only when the pipeline asked for hidden states (SDXL); plain text
+        # encoders that only need last_hidden_state (e.g. WAN/UMT5) are exported
+        # as-is so their existing behaviour is unchanged.
+        if cap.get("output_hidden_states"):
+            _export_overrides[te_name] = _TextEncoderHiddenStatesWrapper(
+                _modules_by_name[te_name]
+            ).to(export_device)
+
+    # 4c. Align every captured float tensor with its module's parameter dtype.
+    # The pipeline may feed a submodule inputs in a different precision than the
+    # module's own weights — most notably SDXL, which upcasts its VAE to fp32 for
+    # decoding while the exported module stays fp16.  Tracing/exporting with the
+    # mismatched dtype crashes ("Input type (float) and bias type (Half) should be
+    # the same"), so cast captured floats to the module's dtype here.  This runs
+    # after the UNet's added_cond tensors have been lifted into `captured`.
+    for name, mod, _, config_src in specs:
+        if name not in captured:
+            continue
+        target_module = _export_overrides.get(name, mod)
+        # SDXL-family VAEs are numerically unstable in fp16 — that is exactly why the
+        # diffusers pipeline sets force_upcast and decodes the VAE in fp32.  Export
+        # the VAE decoder in fp32 so the ONNX graph reproduces the upcast reference
+        # instead of emitting NaNs; the fp16 latents are auto-cast to fp32 at
+        # inference by the ORT session's input handling.
+        force_upcast = bool(
+            getattr(getattr(config_src, "config", None), "force_upcast", False)
+        )
+        if name == "vae_decoder" and force_upcast:
+            target_module.to(torch.float32)
+            mod_dtype = torch.float32
+        else:
+            mod_dtype = next(
+                (p.dtype for p in target_module.parameters() if p.is_floating_point()),
+                None,
+            )
+        if mod_dtype is None:
+            continue
+        captured[name] = {
+            k: (v.to(mod_dtype) if torch.is_tensor(v) and v.is_floating_point() else v)
+            for k, v in captured[name].items()
+        }
 
     # 5. Trace shapes and build ONNX configs for each captured submodule
     output = Path(output)
@@ -614,7 +804,7 @@ def _on_the_fly_diffusion_export(
             continue
         # For vae_decoder: trace the full wrapper (pqc + decoder) using the
         # captured pqc inputs, so the output shapes reflect the decoded video.
-        trace_mod = _vae_decode_export_overrides.get(name, mod)
+        trace_mod = _export_overrides.get(name, mod)
         try:
             inputs, outputs, dynamic_axes = trace_model_shapes(
                 trace_mod,
@@ -629,12 +819,15 @@ def _on_the_fly_diffusion_export(
             )
             continue
 
-        # For vae_decoder the captured input is a single chunk (e.g. 3 frames), but at
-        # inference the full temporal extent varies.  Force dim-2 (frames) to be dynamic
-        # so the exported ONNX accepts any number of frames.
+        # For a *video* vae_decoder the captured input is a single chunk (e.g. 3
+        # frames), but at inference the full temporal extent varies.  Force dim-2
+        # (frames) to be dynamic so the exported ONNX accepts any number of frames.
+        # Image VAEs (4-D latents B,C,H,W) have no temporal axis — skip them.
         if name == "vae_decoder":
-            for inp_name in list(dynamic_axes.keys()):
-                dynamic_axes[inp_name][2] = "num_frames"
+            for inp_name, shape in inputs.items():
+                shape_t = tuple(shape.shape) if isinstance(shape, torch.Tensor) else shape
+                if len(shape_t) == 5:
+                    dynamic_axes.setdefault(inp_name, {0: "batch"})[2] = "num_frames"
 
         dim_names = (module_fixed_axis_fields or {}).get(name, [])
         cfg = (
@@ -657,6 +850,13 @@ def _on_the_fly_diffusion_export(
                     float_dtype = "bf16"
                 break
 
+        # Map each input to the exact dtype of the captured (real) tensor so the
+        # dummy inputs used for export carry the correct dtype.  Without this the
+        # name heuristic would, e.g., generate SDXL's float "time_ids" as int64.
+        model_input_dtypes = {
+            k: v.dtype for k, v in captured[name].items() if torch.is_tensor(v)
+        }
+
         onnx_cfg = DummyOnnxConfig(
             config=cfg,
             task="backbone",
@@ -665,6 +865,7 @@ def _on_the_fly_diffusion_export(
             config_dim=config_dim,
             dynamic_axes=dynamic_axes,
             float_dtype=float_dtype,
+            model_input_dtypes=model_input_dtypes,
         )
 
         # export_pytorch does `model.config.return_dict = True` unconditionally.
@@ -689,7 +890,7 @@ def _on_the_fly_diffusion_export(
         for n in ordered_names:
             mod_n, onnx_cfg_n = models_and_onnx_configs[n]
             # Use the wrapper module if available (e.g. vae_decoder: pqc + decoder)
-            export_mod = _vae_decode_export_overrides.get(n, mod_n)
+            export_mod = _export_overrides.get(n, mod_n)
             # Ensure the export module has a fake config for export_pytorch
             if not hasattr(export_mod, "config"):
                 export_mod.config = mod_n.config if hasattr(mod_n, "config") else SimpleNamespace()
@@ -705,6 +906,7 @@ def _on_the_fly_diffusion_export(
                 config=onnx_cfg_n,
                 output=onnx_path,
                 opset=opset,
+                device=str(export_device),
                 disable_dynamic_axes_fix=True,
                 model_kwargs=mk,
                 do_constant_folding=not is_text_enc,

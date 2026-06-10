@@ -37,9 +37,21 @@ class DummyTupleInputGenerator(DummyInputGenerator):
 
     SUPPORTED_INPUT_NAMES = (".*",)
 
-    def __init__(self, task: str, config_dim: dict[str, int] | None = None, **kwargs):
+    def __init__(
+        self,
+        task: str,
+        config_dim: dict[str, int] | None = None,
+        input_dtypes: dict[str, "torch.dtype"] | None = None,
+        **kwargs,
+    ):
         super().__init__()
         self.config_dim = config_dim or {}
+        # Per-input exact dtypes captured from the real traced tensors. When an
+        # input is present here its dtype is authoritative: it decides int-vs-float
+        # generation and the final tensor is cast to the exact captured dtype.
+        # This is essential for diffusion submodules where the name-based heuristic
+        # would misclassify (e.g. SDXL's float "time_ids" matches the "_id" rule).
+        self.input_dtypes = input_dtypes or {}
 
     def generate(
         self,
@@ -49,6 +61,28 @@ class DummyTupleInputGenerator(DummyInputGenerator):
         int_dtype: str = "int64",
         float_dtype: str = "fp32",
     ) -> torch.Tensor:
+        # When the captured dtype is known, it overrides the name heuristic.
+        captured_dtype = self.input_dtypes.get(input_name)
+        if captured_dtype is not None:
+            if captured_dtype.is_floating_point:
+                tensor = self.random_float_tensor(
+                    list(tensor_shape), framework=framework, dtype=float_dtype
+                )
+            else:
+                max_val = (
+                    max(self.config_dim.get("vocab_size", 1000), 1)
+                    if "input_id" in input_name
+                    else max(max(tensor_shape, default=1), 1)
+                )
+                tensor = self.random_int_tensor(
+                    list(tensor_shape),
+                    max_value=max_val,
+                    min_value=0,
+                    framework=framework,
+                    dtype=int_dtype,
+                )
+            return tensor.to(captured_dtype) if framework == "pt" else tensor
+
         # integer tensors: any *_id(s)*, masks, positions
         if "_id" in input_name or "mask" in input_name or "position" in input_name:
             if "input_id" in input_name:
