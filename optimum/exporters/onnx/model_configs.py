@@ -102,6 +102,7 @@ class DummyOnnxConfig(OnnxConfig):
         model_outputs: dict[str, Any] | None = None,
         config_dim: dict[str, int] | None = None,
         dynamic_axes: "dict[str, dict[int, str]] | None" = None,
+        model_input_dtypes: "dict[str, torch.dtype] | None" = None,
     ):
         super().__init__(
             config=config,
@@ -115,7 +116,9 @@ class DummyOnnxConfig(OnnxConfig):
         self.model_outputs   = model_outputs or {}
         self.config_dim      = config_dim    or {}
         self._dynamic_axes   = dynamic_axes  or {}   # empirically derived
-        self._input_gen      = DummyTupleInputGenerator(task=task, config_dim=self.config_dim)
+        self._input_gen      = DummyTupleInputGenerator(
+            task=task, config_dim=self.config_dim, input_dtypes=model_input_dtypes
+        )
 
         # Tell ModelPatcher to enable KV-cache output when past_key_values are present
         has_kv = any(k.startswith("past_key_values.") for k in self.model_inputs)
@@ -155,8 +158,19 @@ class DummyOnnxConfig(OnnxConfig):
         2. Fallback heuristic: dim-0 always dynamic; other dims dynamic only if
            they don't match any fixed config dimension value.
         """
+        shape = tuple(shape)
+        ndim = len(shape)
+
         if name in self._dynamic_axes:
-            return self._dynamic_axes[name]
+            # Drop any axis index beyond this tensor's rank — e.g. a 0-d scalar
+            # diffusion timestep that would otherwise carry a batch axis, which
+            # torch.onnx rejects ("Dynamic shape axis should be no more than the
+            # shape dimension").
+            return {k: v for k, v in self._dynamic_axes[name].items() if k < ndim}
+
+        # Scalars (0-d) have no axis to mark dynamic.
+        if ndim == 0:
+            return {}
 
         # ── fallback heuristic (single-trial or missing) ──
         axes: dict[int, str] = {0: "batch"}

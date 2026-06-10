@@ -100,6 +100,12 @@ def _generate_variation(inf_kwargs: dict, trial_idx: int, model) -> dict:
         shape = list(val.shape)
         dtype = val.dtype
 
+        # Scalar (0-d) tensors have no batch dimension to vary — e.g. a diffusion
+        # UNet timestep passed as a bare scalar. Keep them verbatim.
+        if not shape:
+            varied[key] = val
+            continue
+
         # Vary batch dimension
         shape[0] = shape[0] * batch_mult
 
