@@ -29,12 +29,33 @@ Usage (no launcher needed)::
 from __future__ import annotations
 
 import json
+import os
 
 
 def _parse_bool_arg(val):
     if isinstance(val, bool):
         return val
     return str(val).lower() in ("1", "true", "yes")
+
+
+def _json_or_file(val):
+    """Parse a JSON CLI argument from either an inline string or a file.
+
+    Accepts, in order:
+      * ``@/path/to/file.json`` — explicit file reference (curl-style)
+      * an existing file path (e.g. ``inputs.json``) — read as JSON
+      * an inline JSON string (e.g. ``'{"input_ids": []}'``)
+
+    This lets large inputs (e.g. a multimodal ``inference_kwargs`` with a big
+    ``pixel_values`` array) live in a file instead of a giant command-line string.
+    """
+    if isinstance(val, str) and val.startswith("@"):
+        with open(os.path.expanduser(val[1:])) as f:
+            return json.load(f)
+    if isinstance(val, str) and os.path.isfile(val):
+        with open(val) as f:
+            return json.load(f)
+    return json.loads(val)
 
 
 def _patch_onnx_export_command() -> None:
@@ -55,22 +76,24 @@ def _patch_onnx_export_command() -> None:
         group = parser.add_argument_group("Inference-driven export (IDMC)")
         group.add_argument(
             "--inference_kwargs",
-            type=json.loads,
+            type=_json_or_file,
             default=None,
-            metavar="JSON",
+            metavar="JSON|FILE",
             help=(
-                "JSON dict of model inputs for tracing. An empty list [] means "
-                'auto-generate a dummy tensor for that input. Example: \'{"input_ids": []}\''
+                "JSON dict of model inputs for tracing, given inline or as a file "
+                "path (e.g. '@inputs.json'). An empty list [] means auto-generate a "
+                'dummy tensor for that input. Example: \'{"input_ids": []}\' or @inputs.json'
             ),
         )
         group.add_argument(
             "--module_fixed_axis_fields",
-            type=json.loads,
+            type=_json_or_file,
             default=None,
-            metavar="JSON",
+            metavar="JSON|FILE",
             help=(
                 "JSON dict of {module_name: [config_field, ...]} whose config dimensions "
-                'should be treated as static (non-dynamic) axes. Example: \'{"transformer": ["hidden_size"]}\''
+                "should be treated as static (non-dynamic) axes, given inline or as a file "
+                'path. Example: \'{"transformer": ["hidden_size"]}\' or @axes.json'
             ),
         )
         group.add_argument(
@@ -82,15 +105,16 @@ def _patch_onnx_export_command() -> None:
         )
         group.add_argument(
             "--fixed_inputs",
-            type=json.loads,
+            type=_json_or_file,
             default=None,
-            metavar="JSON",
+            metavar="JSON|FILE",
             help=(
                 "JSON list of input names whose traced tensor VALUES must be replayed "
                 "verbatim during export/validation instead of being randomly regenerated "
-                "from their shape. Use for inputs whose values control graph structure "
-                "(sizes/indices) or are coupled to other inputs, where a random value "
-                'would break the trace. Example: \'["image_grid_thw", "cache_position"]\''
+                "from their shape, given inline or as a file path. Use for inputs whose "
+                "values control graph structure (sizes/indices) or are coupled to other "
+                'inputs, where a random value would break the trace. '
+                'Example: \'["image_grid_thw", "cache_position"]\' or @fixed.json'
             ),
         )
 
