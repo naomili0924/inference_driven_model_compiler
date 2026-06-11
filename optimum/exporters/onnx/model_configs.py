@@ -213,9 +213,16 @@ class DummyOnnxConfig(OnnxConfig):
         flat: dict[str, torch.Tensor] = {}
 
         for name, val in self.model_inputs.items():
-            shape = tuple(val.shape) if isinstance(val, torch.Tensor) else val
-            tensor = self._input_gen.generate(name, shape, framework=framework,
-                                              int_dtype=int_dtype, float_dtype=float_dtype)
+            if isinstance(val, torch.Tensor):
+                # A real traced tensor was stored (e.g. a vision encoder's
+                # pixel_values / image_grid_thw, whose values are coupled and must
+                # not be randomly regenerated). Use it verbatim so the dummy inputs
+                # stay self-consistent for both export tracing and validation.
+                tensor = val.detach().clone()
+            else:
+                shape = val
+                tensor = self._input_gen.generate(name, shape, framework=framework,
+                                                  int_dtype=int_dtype, float_dtype=float_dtype)
             m = re.match(r"^past_key_values\.(\d+)\.(key|value)$", name)
             if m:
                 kv[(int(m.group(1)), m.group(2))] = tensor

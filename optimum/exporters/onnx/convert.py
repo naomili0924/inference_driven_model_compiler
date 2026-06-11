@@ -110,6 +110,7 @@ def onnx_export_from_model(
     module_fixed_axis_fields: "dict[str, list[str]] | None" = None,
     export_by_inference: bool = False,
     skip_random_generation: bool = False,
+    fixed_inputs: "list[str] | None" = None,
     **kwargs_shapes,
 ):
     TasksManager.standardize_model_attributes(model)
@@ -180,6 +181,7 @@ def onnx_export_from_model(
         inf_kwargs=materialized_inference_kwargs,
         skip_random_generation=skip_random_generation,
         use_cache=task is not None and task.endswith("-with-past"),
+        fixed_inputs=fixed_inputs,
     )
 
     # custom_architecture is False for standard models; only True when user provides

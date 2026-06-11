@@ -51,6 +51,25 @@ def generate_config_dim(model, dim_names: list[str] | None) -> dict[str, int]:
     return {k: getattr(model.config, k) for k in dim_names if hasattr(model.config, k)}
 
 
+def _find_visual_module(model):
+    """Locate the vision-encoder submodule of a multimodal (image-text-to-text) model.
+
+    Returns the submodule that consumes ``pixel_values`` (e.g. Qwen-VL's
+    ``model.visual``), or ``None`` for a text-only model.
+    """
+    for attr in ("visual", "vision_tower", "vision_model"):
+        mod = getattr(model, attr, None)
+        if mod is not None:
+            return mod
+    inner = getattr(model, "model", None)
+    if inner is not None and inner is not model:
+        for attr in ("visual", "vision_tower", "vision_model"):
+            mod = getattr(inner, attr, None)
+            if mod is not None:
+                return mod
+    return None
+
+
 def _flatten_output(output) -> dict[str, tuple]:
     """Collect {name: shape} for every tensor field of a model output."""
     from dataclasses import fields, is_dataclass
@@ -489,6 +508,49 @@ def get_dynamic_model_for_export(
                                           config_dim=generate_config_dim(model, (module_fixed_axis_fields or {}).get("transformer", [])))
     models_for_export = {}
     models_for_export["transformer"] = (export_model, transformer_config)
+
+    # --- Optional vision encoder (only when pixel_values were traced) ---
+    # Exported as a separate ``vision_encoder.onnx`` taking pixel_values +
+    # image_grid_thw and producing image_embeds. The Qwen-VL vision tower bakes
+    # grid_thw into the trace as constants, so the graph is specialized to the
+    # traced image; we therefore mark its axes static to keep export/validation
+    # self-consistent (and avoid fix_dynamic_axes varying the coupled inputs).
+    if models_and_inputs is not None and "vision_encoder" in models_and_inputs:
+        import torch.nn as _nn
+
+        visual = _find_visual_module(model)
+
+        class _VisionEncoderWrapper(_nn.Module):
+            def __init__(self, visual, config):
+                super().__init__()
+                self.visual = visual
+                # export_pytorch sets ``model.config.return_dict`` and the exporter
+                # saves ``model.config``; expose the parent config so the wrapper
+                # behaves like a normal exportable model.
+                self.config = config
+
+            def forward(self, pixel_values, image_grid_thw):
+                return self.visual(pixel_values, grid_thw=image_grid_thw)
+
+        vision_wrapper = _VisionEncoderWrapper(visual, model.config)
+        static_axes = {
+            name: {}
+            for name in list(models_and_inputs["vision_encoder"])
+            + list(models_and_outputs["vision_encoder"])
+        }
+        vision_config = DummyOnnxConfig(
+            config=model.config,
+            task="feature-extraction",
+            preprocessors=None,
+            int_dtype=int_dtype,
+            float_dtype=float_dtype,
+            model_inputs=models_and_inputs["vision_encoder"],
+            model_outputs=models_and_outputs["vision_encoder"],
+            config_dim={},
+            dynamic_axes=static_axes,
+        )
+        models_for_export["vision_encoder"] = (vision_wrapper, vision_config)
+
     return models_for_export
     
 
@@ -667,8 +729,24 @@ def _get_submodels_and_tensors_(
     inf_kwargs: dict[str, Any] | None = None,
     skip_random_generation: bool = False,
     use_cache: bool = False,
+    fixed_inputs: list[str] | None = None,
 ):
     from transformers import PreTrainedModel
+    # Inputs the user marked as "value-exact": their traced tensor is replayed
+    # verbatim at export/validation instead of being randomly regenerated from
+    # its shape. Use for inputs whose values control graph structure (sizes,
+    # indices) or are coupled to other inputs.
+    _fixed = set(fixed_inputs or [])
+
+    def _store_input(store: dict, key: str, val):
+        """Record an input as a shape tuple, or as the real tensor when the input
+        is value-exact (``skip_random_generation`` globally, or listed in
+        ``fixed_inputs``)."""
+        if torch.is_tensor(val) and (skip_random_generation or key in _fixed):
+            store[key] = val.detach()
+        else:
+            store[key] = tuple(val.shape) if torch.is_tensor(val) else val
+
     if isinstance(model, PreTrainedModel):
         dummy_inputs = {"transformer": {}}
         dummy_outputs = {"transformer": {}}
@@ -713,15 +791,57 @@ def _get_submodels_and_tensors_(
             with torch.no_grad():
                 enc_out = _encoder_mod(**enc_kwargs)
             for key, val in enc_kwargs.items():
-                dummy_inputs["transformer"][key] = (
-                    val if skip_random_generation else tuple(val.shape)
-                )
+                _store_input(dummy_inputs["transformer"], key, val)
             dummy_outputs["transformer"].update(_flatten_output(enc_out))
             return dummy_inputs, dummy_outputs
+
+        # --- Vision-encoder capture (text+image / image-text-to-text models) ---
+        # When pixel_values are supplied we additionally export the vision encoder
+        # as its own submodule. We hook it during the prefill forward to capture
+        # the *actual* (pixel_values, grid_thw) tensors it receives — their values
+        # are coupled (grid product == patch count), so they must be replayed
+        # verbatim rather than randomly regenerated.
+        _vision_cap: dict = {}
+        _vision_hooks = []
+        _vision_module = _find_visual_module(model) if "pixel_values" in prefill_kwargs else None
+        if _vision_module is not None:
+            def _vision_pre_hook(_mod, args, kwargs):
+                _vision_cap["args"] = args
+                _vision_cap["kwargs"] = kwargs
+            def _vision_post_hook(_mod, _inp, output):
+                _vision_cap["output"] = output
+            _vision_hooks = [
+                _vision_module.register_forward_pre_hook(_vision_pre_hook, with_kwargs=True),
+                _vision_module.register_forward_hook(_vision_post_hook),
+            ]
 
         # Prefill forward: no past_key_values, traces all input shapes
         with torch.no_grad():
             prefill_output = model(**prefill_kwargs)
+
+        for _h in _vision_hooks:
+            _h.remove()
+        if _vision_module is not None and "output" in _vision_cap:
+            _v_args = _vision_cap.get("args", ())
+            _v_kwargs = _vision_cap.get("kwargs", {})
+            _pixel_values = _v_args[0] if _v_args else (
+                _v_kwargs.get("hidden_states") or _v_kwargs.get("pixel_values")
+            )
+            _grid_thw = _v_kwargs.get("grid_thw")
+            if _grid_thw is None and len(_v_args) > 1:
+                _grid_thw = _v_args[1]
+            _v_out = _vision_cap["output"]
+            if torch.is_tensor(_pixel_values) and torch.is_tensor(_grid_thw):
+                # Store the real tensors (not shape tuples) so generate_dummy_inputs
+                # replays them verbatim — keeping pixel_values and grid_thw consistent.
+                dummy_inputs["vision_encoder"] = {
+                    "pixel_values": _pixel_values.detach(),
+                    "image_grid_thw": _grid_thw.detach(),
+                }
+                if torch.is_tensor(_v_out):
+                    dummy_outputs["vision_encoder"] = {"image_embeds": tuple(_v_out.shape)}
+                else:
+                    dummy_outputs["vision_encoder"] = _flatten_output(_v_out)
 
         past_key_values = getattr(prefill_output, "past_key_values", None)
 
@@ -776,18 +896,15 @@ def _get_submodels_and_tensors_(
             with torch.no_grad():
                 decode_output = model(**decode_kwargs)
 
-            def _store(d, key, val):
-                d[key] = val if skip_random_generation else tuple(val.shape)
-
             # Record flat tensor inputs (not past_key_values yet)
             for key, val in decode_kwargs.items():
                 if torch.is_tensor(val):
-                    _store(dummy_inputs["transformer"], key, val)
+                    _store_input(dummy_inputs["transformer"], key, val)
 
             # Flatten past_key_values into named inputs.
             for i, k, v in _iter_pkv(decode_kwargs["past_key_values"]):
-                _store(dummy_inputs["transformer"], f"past_key_values.{i}.key", k)
-                _store(dummy_inputs["transformer"], f"past_key_values.{i}.value", v)
+                _store_input(dummy_inputs["transformer"], f"past_key_values.{i}.key", k)
+                _store_input(dummy_inputs["transformer"], f"past_key_values.{i}.value", v)
 
             # Record outputs
             if getattr(decode_output, "logits", None) is not None:
@@ -806,9 +923,7 @@ def _get_submodels_and_tensors_(
         else:
             # No KV cache: original single-step behaviour + position_ids
             for key, val in prefill_kwargs.items():
-                dummy_inputs["transformer"][key] = (
-                    val if skip_random_generation else tuple(val.shape)
-                )
+                _store_input(dummy_inputs["transformer"], key, val)
             hooks = [model.register_forward_hook(
                 make_dataclass_output_hook(dummy_outputs, "transformer")
             )]

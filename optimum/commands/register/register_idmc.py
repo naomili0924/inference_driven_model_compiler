@@ -80,6 +80,19 @@ def _patch_onnx_export_command() -> None:
             metavar="BOOL",
             help="Enable inference-driven export (default: false).",
         )
+        group.add_argument(
+            "--fixed_inputs",
+            type=json.loads,
+            default=None,
+            metavar="JSON",
+            help=(
+                "JSON list of input names whose traced tensor VALUES must be replayed "
+                "verbatim during export/validation instead of being randomly regenerated "
+                "from their shape. Use for inputs whose values control graph structure "
+                "(sizes/indices) or are coupled to other inputs, where a random value "
+                'would break the trace. Example: \'["image_grid_thw", "cache_position"]\''
+            ),
+        )
 
     def run(self):
         from optimum.exporters.onnx.__main__ import main_export
@@ -117,6 +130,7 @@ def _patch_onnx_export_command() -> None:
             inference_kwargs=self.args.inference_kwargs,
             module_fixed_axis_fields=self.args.module_fixed_axis_fields,
             export_by_inference=self.args.export_by_inference,
+            fixed_inputs=self.args.fixed_inputs,
             **input_shapes,
         )
 

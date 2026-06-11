@@ -53,6 +53,8 @@ def main_export(
     # flag for export_by_inference
     export_by_inference: bool = False,
     skip_random_generation: bool = False,
+    # names of inputs whose traced VALUES must be replayed verbatim (not randomized)
+    fixed_inputs: list[str] | None = None,
     # hub options
     subfolder: str = "",
     revision: str = "main",
@@ -300,6 +302,7 @@ def main_export(
         module_fixed_axis_fields=module_fixed_axis_fields,
         export_by_inference=export_by_inference,
         skip_random_generation=skip_random_generation,
+        fixed_inputs=fixed_inputs,
         **kwargs_shapes,
     )
 
