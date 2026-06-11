@@ -135,7 +135,7 @@ class ORTModelForImageTextToText:
 
     def __init__(self, *, embed_session, vision_session, decoder_session, processor,
                  config, rope_index_fn, image_token_id, eos_token_ids, export_grid_thw,
-                 n_layers, n_kv_heads, head_dim):
+                 n_layers, n_kv_heads, head_dim, image_size):
         self.embed_session = embed_session
         self.vision_session = vision_session
         self.decoder_session = decoder_session
@@ -144,7 +144,8 @@ class ORTModelForImageTextToText:
         self._rope_fn = rope_index_fn
         self.image_token_id = image_token_id
         self.eos_token_ids = set(eos_token_ids)
-        self.export_grid_thw = export_grid_thw  # the grid the vision graph was traced for
+        self.image_size = image_size            # the export target the vision graph was built for
+        self.export_grid_thw = export_grid_thw  # the resolved grid (from the processor) for that target
         self.n_layers = n_layers
         self.n_kv_heads = n_kv_heads
         self.head_dim = head_dim
@@ -158,8 +159,10 @@ class ORTModelForImageTextToText:
         from transformers import AutoModelForImageTextToText, AutoProcessor
         from onnxruntime import InferenceSession
 
-        if image_size % 28 != 0:
-            raise ValueError(f"image_size must be a multiple of 28 (patch*merge); got {image_size}")
+        # image_size is a *target* pixel budget, not a hard constraint: the Qwen
+        # processor's smart_resize maps any value to a valid grid (snapping each
+        # side to a multiple of patch*merge=28). We export the vision graph for
+        # whatever grid that representative input produces — no feature resizing.
 
         export_dir = Path(export_dir or (Path("/dev/shm") / f"ort_itt_{Path(model_id).name}_{image_size}"))
         export_dir.mkdir(parents=True, exist_ok=True)
@@ -243,13 +246,16 @@ class ORTModelForImageTextToText:
             decoder_session=sessions["decoder"], processor=processor, config=config,
             rope_index_fn=rope_index_fn, image_token_id=image_token_id,
             eos_token_ids=eos_ids, export_grid_thw=export_grid_thw,
-            n_layers=n_layers, n_kv_heads=n_kv, head_dim=head_dim,
+            n_layers=n_layers, n_kv_heads=n_kv, head_dim=head_dim, image_size=image_size,
         )
 
     # ── generation ─────────────────────────────────────────────────────────────
 
     @torch.no_grad()
     def generate(self, image, text, max_new_tokens: int = 32, return_text: bool = True):
+        # Snap the input image to the export target so its grid matches the static
+        # vision graph (this is plain image resizing, not feature resizing).
+        image = image.convert("RGB").resize((self.image_size, self.image_size))
         inp = self._build_inputs(self.processor, image, text, self.image_token_id)
         if inp["image_grid_thw"].tolist() != self.export_grid_thw:
             raise ValueError(
