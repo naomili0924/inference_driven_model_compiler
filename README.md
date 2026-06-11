@@ -41,7 +41,7 @@ integration is inert unless the shadow `optimum` is active.
 ## CLI export
 
 When this repo is on `PYTHONPATH` (see Installation), the standard
-`optimum-cli export onnx` command gains three extra flags — no separate tool or
+`optimum-cli export onnx` command gains four extra flags — no separate tool or
 launcher needed. They are registered automatically via
 `optimum/commands/register/register_idmc.py`, which optimum-cli auto-discovers:
 
@@ -49,7 +49,40 @@ launcher needed. They are registered automatically via
 |---|---|
 | `--export_by_inference` | Enable inference-driven export (traces the model instead of using a hand-written `OnnxConfig`). |
 | `--module_fixed_axis_fields` | JSON dict mapping submodule names to config field names whose values should be treated as **static** tensor dimensions. |
-| `--inference_kwargs` | JSON dict of inputs used to trace the model (overrides the auto-generated dummy inputs). |
+| `--inference_kwargs` | Inputs used to trace the model (overrides the auto-generated dummy inputs). Accepts **inline JSON or a file path**. |
+| `--fixed_inputs` | JSON list of input names whose traced **values** must be replayed verbatim instead of being randomly regenerated from their shape. Accepts inline JSON or a file path. |
+
+> **`--fixed_inputs` — value-exact inputs:** by default the tracer records only
+> the *shape* of each traced input and regenerates a random tensor of that shape
+> at export/validation time (which also lets it discover dynamic axes). That is
+> fine when only the shape matters, but breaks for inputs whose **value** drives
+> graph construction — sizes, counts, indices, or anything read via `.item()` /
+> `.tolist()` / a reshape target — or inputs coupled to another (e.g. a vision
+> encoder's `image_grid_thw`, whose product must equal `pixel_values`' patch
+> count). List those names here to replay their real traced values verbatim:
+>
+> ```bash
+> --fixed_inputs='["image_grid_thw", "cache_position"]'
+> ```
+>
+> (For image-text-to-text models the vision encoder's `pixel_values` /
+> `image_grid_thw` are pinned automatically; use `--fixed_inputs` for any
+> additional value-exact inputs.)
+
+> **JSON-or-file:** `--inference_kwargs`, `--module_fixed_axis_fields` and
+> `--fixed_inputs` accept
+> either inline JSON or a path to a `.json` file — handy when the inputs are large
+> (e.g. a multimodal `inference_kwargs` with a big `pixel_values` array). Three
+> accepted forms, resolved in this order:
+>
+> ```bash
+> --inference_kwargs=@inputs.json     # '@' prefix: read from file (curl-style)
+> --inference_kwargs=inputs.json      # bare path to an existing file: read from file
+> --inference_kwargs='{"input_ids": []}'   # inline JSON string
+> ```
+>
+> The `@` prefix only *forces* file interpretation; a bare path works too as long
+> as the file exists at parse time.
 
 ### Encoder model
 
