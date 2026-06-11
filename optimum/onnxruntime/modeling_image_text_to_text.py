@@ -20,8 +20,8 @@ Scope of this first milestone (intentionally minimal):
   * single image, batch size 1
   * **fixed resolution** chosen at export via ``image_size`` (the vision graph is
     shape-specialised; the Qwen-VL tower bakes ``grid_thw`` into the trace)
-  * greedy decoding, no KV cache (each step re-runs the decoder over the full
-    sequence — correct, just not yet optimised)
+  * greedy decoding **with a KV cache**: one merged decoder graph serves both the
+    prefill pass (0-length past) and incremental single-token decode (past length P)
 
 Usage::
 
@@ -72,41 +72,70 @@ class _VisionWrapper(torch.nn.Module):
         return self.visual(pixel_values, grid_thw=image_grid_thw)
 
 
-class _DecoderWrapper(torch.nn.Module):
-    """Full model forward over inputs_embeds (no input_ids / pixel_values), no cache.
+class _CachedDecoderWrapper(torch.nn.Module):
+    """Full model forward over inputs_embeds with a KV cache.
 
-    ``attention_mask`` is a precomputed **4-D** additive mask (B, 1, Q, KV). A 4-D
-    mask makes transformers return it as-is (``_preprocess_mask_arguments`` early
-    exit) instead of building one with ``torch.vmap`` — which the torchscript ONNX
-    exporter cannot trace.
+    Takes the past key/values flattened as positional tensors and returns
+    ``(logits, *present)`` flattened the same way. One graph serves both phases:
+      * prefill: past length 0 (0-length tensors), query = prompt length
+      * decode:  past length P,                  query = 1
+    ``attention_mask`` is a precomputed **4-D** additive mask (B, 1, Q, KV=P+Q); a
+    4-D mask makes transformers skip the ``torch.vmap`` mask path that the
+    torchscript ONNX exporter cannot trace.
     """
-    def __init__(self, model):
+    def __init__(self, model, n_layers):
         super().__init__()
         self.model = model
+        self.n_layers = n_layers
 
-    def forward(self, inputs_embeds, attention_mask, position_ids):
-        return self.model(
+    def forward(self, inputs_embeds, attention_mask, position_ids, *past):
+        from transformers import DynamicCache
+        legacy = tuple((past[2 * i], past[2 * i + 1]) for i in range(self.n_layers))
+        cache = DynamicCache.from_legacy_cache(legacy)
+        out = self.model(
             inputs_embeds=inputs_embeds,
             attention_mask=attention_mask,
             position_ids=position_ids,
-            use_cache=False,
-        ).logits
+            past_key_values=cache,
+            use_cache=True,
+        )
+        flat = []
+        for layer in out.past_key_values.layers:
+            flat.extend([layer.keys, layer.values])
+        return (out.logits, *flat)
 
 
-def _causal_4d(seq_len: int, dtype: torch.dtype) -> torch.Tensor:
-    """Standard causal additive mask of shape (1, 1, seq_len, seq_len): 0 where a
-    query may attend to a key, ``finfo.min`` above the diagonal."""
+def _causal_4d_kv(q_len: int, kv_len: int, dtype: torch.dtype) -> torch.Tensor:
+    """Causal additive mask (1, 1, q_len, kv_len) for a KV cache of length P=kv-q.
+
+    Query i (absolute position P+i) may attend to key j iff ``j <= P+i``; masked
+    entries are ``finfo.min``. Prefill (P=0) → triangular; decode (q=1) → all-zero.
+    """
     min_val = torch.finfo(dtype).min
-    m = torch.full((seq_len, seq_len), min_val, dtype=dtype)
-    m = torch.triu(m, diagonal=1)
+    offset = kv_len - q_len
+    i = torch.arange(q_len).unsqueeze(1)
+    j = torch.arange(kv_len).unsqueeze(0)
+    allowed = j <= (offset + i)
+    m = torch.where(allowed, torch.zeros((), dtype=dtype), torch.full((), min_val, dtype=dtype))
     return m[None, None]
+
+
+def _cache_dims(config):
+    tc = getattr(config, "text_config", config)
+    n_layers = getattr(tc, "num_hidden_layers", getattr(config, "num_hidden_layers"))
+    n_heads = getattr(tc, "num_attention_heads", getattr(config, "num_attention_heads"))
+    n_kv = getattr(tc, "num_key_value_heads", n_heads)
+    hidden = getattr(tc, "hidden_size", getattr(config, "hidden_size"))
+    head_dim = getattr(tc, "head_dim", hidden // n_heads)
+    return int(n_layers), int(n_kv), int(head_dim)
 
 
 class ORTModelForImageTextToText:
     """ONNX Runtime image-text-to-text pipeline (Qwen-VL family, fixed resolution)."""
 
     def __init__(self, *, embed_session, vision_session, decoder_session, processor,
-                 config, rope_index_fn, image_token_id, eos_token_ids, export_grid_thw):
+                 config, rope_index_fn, image_token_id, eos_token_ids, export_grid_thw,
+                 n_layers, n_kv_heads, head_dim):
         self.embed_session = embed_session
         self.vision_session = vision_session
         self.decoder_session = decoder_session
@@ -116,6 +145,9 @@ class ORTModelForImageTextToText:
         self.image_token_id = image_token_id
         self.eos_token_ids = set(eos_token_ids)
         self.export_grid_thw = export_grid_thw  # the grid the vision graph was traced for
+        self.n_layers = n_layers
+        self.n_kv_heads = n_kv_heads
+        self.head_dim = head_dim
 
     # ── export + load ──────────────────────────────────────────────────────────
 
@@ -167,18 +199,37 @@ class ORTModelForImageTextToText:
                 input_names=["pixel_values", "image_grid_thw"], output_names=["image_embeds"],
                 opset_version=18, dynamo=False,  # static: fixed resolution
             )
-            embeds = pt.get_input_embeddings()(ex["input_ids"])
+            # --- decoder with KV cache: trace one real decode step (q=1, past=prompt) ---
             rope_index_fn = _make_rope_index_fn(pt)
-            pos, _ = rope_index_fn(ex["input_ids"], ex["image_grid_thw"], None, ex["attention_mask"])
+            n_layers, n_kv, head_dim = _cache_dims(config)
+            prompt_embeds = pt.get_input_embeddings()(ex["input_ids"]).clone()
+            ie = pt.model.visual(ex["pixel_values"], grid_thw=ex["image_grid_thw"])
+            prompt_embeds[ex["input_ids"] == image_token_id] = ie.to(prompt_embeds.dtype)
             seq = ex["input_ids"].shape[1]
-            mask4d = _causal_4d(seq, dtype)
+            pos_prefill, _ = rope_index_fn(ex["input_ids"], ex["image_grid_thw"], None, ex["attention_mask"])
+            out0 = pt(inputs_embeds=prompt_embeds, attention_mask=_causal_4d_kv(seq, seq, dtype),
+                      position_ids=pos_prefill, use_cache=True)
+            past_flat = []
+            for layer in out0.past_key_values.layers:
+                past_flat.extend([layer.keys.detach(), layer.values.detach()])
+            dec_embed = prompt_embeds[:, -1:, :].detach()          # (1, 1, H)
+            dec_pos = (pos_prefill[:, :, -1:] + 1).detach()        # (3, 1, 1)
+            dec_mask = _causal_4d_kv(1, seq + 1, dtype)            # (1, 1, 1, seq+1)
+
+            past_names = [f"past_key_values.{i}.{kv}" for i in range(n_layers) for kv in ("key", "value")]
+            present_names = [f"present.{i}.{kv}" for i in range(n_layers) for kv in ("key", "value")]
+            dyn = {"inputs_embeds": {1: "q"}, "attention_mask": {2: "q", 3: "kv"},
+                   "position_ids": {2: "q"}, "logits": {1: "q"}}
+            for nm in past_names:
+                dyn[nm] = {2: "past"}
+            for nm in present_names:
+                dyn[nm] = {2: "kv"}
             torch.onnx.export(
-                _DecoderWrapper(pt), (embeds, mask4d, pos), paths["decoder"],
-                input_names=["inputs_embeds", "attention_mask", "position_ids"],
-                output_names=["logits"],
-                dynamic_axes={"inputs_embeds": {1: "seq"}, "attention_mask": {2: "q", 3: "kv"},
-                              "position_ids": {2: "seq"}, "logits": {1: "seq"}},
-                opset_version=18, dynamo=False,
+                _CachedDecoderWrapper(pt, n_layers),
+                (dec_embed, dec_mask, dec_pos, *past_flat), paths["decoder"],
+                input_names=["inputs_embeds", "attention_mask", "position_ids", *past_names],
+                output_names=["logits", *present_names],
+                dynamic_axes=dyn, opset_version=18, dynamo=False,
             )
 
         eos_ids = _eos_ids(config, getattr(pt, "generation_config", None))
@@ -192,6 +243,7 @@ class ORTModelForImageTextToText:
             decoder_session=sessions["decoder"], processor=processor, config=config,
             rope_index_fn=rope_index_fn, image_token_id=image_token_id,
             eos_token_ids=eos_ids, export_grid_thw=export_grid_thw,
+            n_layers=n_layers, n_kv_heads=n_kv, head_dim=head_dim,
         )
 
     # ── generation ─────────────────────────────────────────────────────────────
@@ -217,30 +269,58 @@ class ORTModelForImageTextToText:
         mask = (input_ids.numpy() == self.image_token_id)
         embeds[mask] = image_embeds.astype(embeds.dtype)
 
+        # --- prefill: past length 0, query = whole prompt ---
+        seq = input_ids.shape[1]
+        pos, _ = self._rope_fn(input_ids, inp["image_grid_thw"], None, attention_mask)
+        feed = {
+            "inputs_embeds": embeds.astype(np.float32),
+            "attention_mask": _causal_4d_kv(seq, seq, torch.float32).numpy(),
+            "position_ids": _np(pos, np.int64),
+        }
+        feed.update(self._empty_past())
+        outs = self._run(self.decoder_session, feed)
+        logits, present = outs[0], outs[1:]
+        next_id = int(logits[0, -1].argmax())
+
         cur_ids = input_ids
         generated = []
+        past_len = seq
         for _ in range(max_new_tokens):
-            pos, _ = self._rope_fn(cur_ids, inp["image_grid_thw"], None, attention_mask)
-            mask4d = _causal_4d(cur_ids.shape[1], torch.float32).numpy()
-            logits = self._run(self.decoder_session, {
-                "inputs_embeds": embeds.astype(np.float32),
-                "attention_mask": mask4d,
-                "position_ids": _np(pos, np.int64),
-            })[0]
-            next_id = int(logits[0, -1].argmax())
             if next_id in self.eos_token_ids:
                 break
             generated.append(next_id)
-            # append the new token's embedding / ids / mask
-            new_embed = self._run(self.embed_session,
-                                  {"input_ids": np.array([[next_id]], np.int64)})[0]
-            embeds = np.concatenate([embeds, new_embed.astype(embeds.dtype)], axis=1)
             cur_ids = torch.cat([cur_ids, torch.tensor([[next_id]])], dim=1)
             attention_mask = torch.cat([attention_mask, torch.ones((1, 1), dtype=attention_mask.dtype)], dim=1)
+            # --- decode: feed only the new token + the cached past ---
+            new_embed = self._run(self.embed_session, {"input_ids": np.array([[next_id]], np.int64)})[0]
+            pos, _ = self._rope_fn(cur_ids, inp["image_grid_thw"], None, attention_mask)
+            feed = {
+                "inputs_embeds": new_embed.astype(np.float32),
+                "attention_mask": _causal_4d_kv(1, past_len + 1, torch.float32).numpy(),
+                "position_ids": _np(pos[:, :, -1:], np.int64),
+            }
+            feed.update(self._past_feed(present))
+            outs = self._run(self.decoder_session, feed)
+            logits, present = outs[0], outs[1:]
+            next_id = int(logits[0, -1].argmax())
+            past_len += 1
 
         if return_text:
             return self.processor.tokenizer.decode(generated, skip_special_tokens=True)
         return generated
+
+    # ── KV-cache helpers ─────────────────────────────────────────────────────────
+
+    def _past_names(self):
+        return [f"past_key_values.{i}.{kv}" for i in range(self.n_layers) for kv in ("key", "value")]
+
+    def _empty_past(self):
+        z = np.zeros((1, self.n_kv_heads, 0, self.head_dim), dtype=np.float32)
+        return {name: z for name in self._past_names()}
+
+    def _past_feed(self, present):
+        # present (session outputs after logits) is in the same order as the past inputs
+        return {name: present[i].astype(np.float32) for i, name in enumerate(self._past_names())}
 
     # ── helpers ────────────────────────────────────────────────────────────────
 
