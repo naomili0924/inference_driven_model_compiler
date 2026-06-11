@@ -174,49 +174,79 @@ class ORTUnet(ORTModelMixin):
 
 
 class ORTTransformer(ORTModelMixin):
-    def forward(
-        self,
-        hidden_states: np.ndarray | torch.Tensor,
-        encoder_hidden_states: np.ndarray | torch.Tensor,
-        timestep: np.ndarray | torch.Tensor,
-        pooled_projections: np.ndarray | torch.Tensor | None = None,
-        guidance: np.ndarray | torch.Tensor | None = None,
-        txt_ids: np.ndarray | torch.Tensor | None = None,
-        img_ids: np.ndarray | torch.Tensor | None = None,
-        joint_attention_kwargs: dict[str, Any] | None = None,
-        encoder_attention_mask: torch.Tensor | None = None,
-        attention_kwargs: dict[str, Any] | None = None,
-        # CogVideoX-specific (constant-folded into ONNX, accepted but not forwarded)
-        timestep_cond: np.ndarray | torch.Tensor | None = None,
-        ofs: np.ndarray | torch.Tensor | None = None,
-        image_rotary_emb: tuple | None = None,
-        return_dict: bool = True,
-    ):
-        use_torch = isinstance(hidden_states, torch.Tensor)
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # Some pipelines (e.g. HunyuanDiT) read transformer config attributes
+        # directly off the model — to build rotary embeddings — before calling
+        # forward. Surface the common ones from the saved config so the ONNX
+        # wrapper stands in for the real module.
+        nh = getattr(self.config, "num_attention_heads", None)
+        if nh is not None and not hasattr(self, "num_heads"):
+            self.num_heads = nh
+        if not hasattr(self, "inner_dim"):
+            inner = getattr(self.config, "hidden_size", None)
+            if inner is None and nh is not None:
+                hd = getattr(self.config, "attention_head_dim", None)
+                inner = nh * hd if hd else None
+            if inner is not None:
+                self.inner_dim = inner
+        self._fwd_names = None
 
-        model_inputs = {
-            "hidden_states": hidden_states,
-            "encoder_hidden_states": encoder_hidden_states,
-            "encoder_attention_mask": encoder_attention_mask,
-            "pooled_projections": pooled_projections,
-            "timestep": timestep,
-            "guidance": guidance,
-            "txt_ids": txt_ids,
-            "img_ids": img_ids,
-            **(joint_attention_kwargs or {}),
-            **(attention_kwargs or {}),
-        }
+    def _forward_param_names(self):
+        """The real (diffusers) transformer's forward parameter order.
+
+        Pipelines call the transformer with model-specific positional ordering
+        (HunyuanDiT: hidden_states, timestep, …; Flux/SD3 differ). Recover the
+        order from the saved config's _class_name so we can bind *args correctly.
+        """
+        if self._fwd_names is None:
+            cn = None
+            try:
+                cn = self.config["_class_name"]
+            except Exception:
+                cn = getattr(self.config, "_class_name", None)
+            names = []
+            try:
+                import inspect as _insp
+                cls = getattr(diffusers, cn, None) if cn else None
+                if cls is not None:
+                    names = [p for p in _insp.signature(cls.forward).parameters if p != "self"]
+            except Exception:
+                names = []
+            self._fwd_names = names or ["hidden_states", "encoder_hidden_states", "timestep"]
+        return self._fwd_names
+
+    def forward(self, *args, return_dict: bool = True, **kwargs):
+        # Bind positional args to the real module's parameter order, then feed the
+        # exported graph exactly the inputs it declares. This is convention-agnostic,
+        # so it works across HunyuanDiT / Flux / SD3 / WAN / CogVideoX without a
+        # per-model signature.
+        names = self._forward_param_names()
+        bound = dict(kwargs)
+        for i, a in enumerate(args):
+            if i < len(names):
+                bound.setdefault(names[i], a)
+        # Flatten nested kwargs dicts into the flat namespace.
+        for dk in ("joint_attention_kwargs", "attention_kwargs",
+                   "cross_attention_kwargs", "added_cond_kwargs"):
+            d = bound.get(dk)
+            if isinstance(d, dict):
+                for k2, v2 in d.items():
+                    bound.setdefault(k2, v2)
+
+        hidden_states = bound.get("hidden_states")
+        use_torch = isinstance(hidden_states, torch.Tensor)
+        model_inputs = {n: bound[n] for n in self.input_names
+                        if n in bound and bound[n] is not None}
 
         if self.use_io_binding:
             known_output_shapes = load_shapes_as_torch_size(self.io_binding_file)
-            known_output_shapes["out_hidden_states"] = hidden_states.shape
-            known_output_buffers = None
-            if "Flux" not in self.parent.__class__.__name__:
-                known_output_buffers = {"out_hidden_states": hidden_states}
+            if hidden_states is not None:
+                known_output_shapes.setdefault("out_hidden_states", hidden_states.shape)
             output_shapes, output_buffers = self._prepare_io_binding(
                 model_inputs,
                 known_output_shapes=known_output_shapes,
-                known_output_buffers=known_output_buffers,
+                known_output_buffers=None,
             )
             if self.device.type == "cpu":
                 self.session.run_with_iobinding(self._io_binding)
@@ -514,6 +544,43 @@ class _TextEncoderHiddenStatesWrapper(torch.nn.Module):
         return result
 
 
+class _RotaryBakedTransformerWrapper(torch.nn.Module):
+    """Export wrapper for DiTs whose rotary embedding is supplied by the pipeline
+    as a (cos, sin) tuple — e.g. HunyuanDiT's ``image_rotary_emb``.
+
+    The inference tracer only forwards tensor arguments, so the tuple is dropped
+    and the transformer would trace with ``image_rotary_emb=None`` (broken
+    attention → noise). Because a given deployment uses a fixed resolution, the
+    rotary is deterministic, so we bake the captured (cos, sin) into the graph as
+    constant buffers and expose only the plain tensor inputs. The exported graph
+    is then correct at that resolution with no runtime rotary plumbing.
+    """
+
+    def __init__(self, transformer: torch.nn.Module, cos, sin):
+        super().__init__()
+        self.transformer = transformer
+        self.register_buffer("rope_cos", cos)
+        self.register_buffer("rope_sin", sin)
+
+    def forward(self, hidden_states, timestep, encoder_hidden_states,
+                text_embedding_mask=None, encoder_hidden_states_t5=None,
+                text_embedding_mask_t5=None, image_meta_size=None, style=None):
+        out = self.transformer(
+            hidden_states=hidden_states,
+            timestep=timestep,
+            encoder_hidden_states=encoder_hidden_states,
+            text_embedding_mask=text_embedding_mask,
+            encoder_hidden_states_t5=encoder_hidden_states_t5,
+            text_embedding_mask_t5=text_embedding_mask_t5,
+            image_meta_size=image_meta_size,
+            style=style,
+            image_rotary_emb=(self.rope_cos, self.rope_sin),
+            return_dict=False,
+        )
+        sample = out[0] if isinstance(out, (list, tuple)) else out
+        return {"sample": sample}
+
+
 def _on_the_fly_diffusion_export(
     model_name_or_path,
     output,
@@ -746,6 +813,18 @@ def _on_the_fly_diffusion_export(
                 _modules_by_name[te_name]
             ).to(export_device)
 
+    # Transformer rotary baking: if the denoiser was called with an
+    # image_rotary_emb (cos, sin) tuple (HunyuanDiT), bake it into the export so
+    # attention is correct — the tuple is otherwise dropped during tracing.
+    cap = captured.get("transformer")
+    if cap is not None and "transformer" not in _export_overrides:
+        rot = cap.get("image_rotary_emb")
+        if (isinstance(rot, (tuple, list)) and len(rot) == 2
+                and all(torch.is_tensor(t) for t in rot)):
+            _export_overrides["transformer"] = _RotaryBakedTransformerWrapper(
+                _modules_by_name["transformer"], rot[0], rot[1]
+            ).to(export_device)
+
     # 4c. Align every captured float tensor with its module's parameter dtype.
     # The pipeline may feed a submodule inputs in a different precision than the
     # module's own weights — most notably SDXL, which upcasts its VAE to fp32 for
@@ -753,6 +832,12 @@ def _on_the_fly_diffusion_export(
     # mismatched dtype crashes ("Input type (float) and bias type (Half) should be
     # the same"), so cast captured floats to the module's dtype here.  This runs
     # after the UNet's added_cond tensors have been lifted into `captured`.
+    # Submodules forced to fp32 via env var (e.g. a DiT transformer that is
+    # fp16-unstable once its internal fp32 upcasts are flattened into the ONNX
+    # graph — HunyuanDiT). Comma-separated submodule names.
+    _force_fp32 = {
+        s.strip() for s in os.environ.get("IDMC_FP32_MODULES", "").split(",") if s.strip()
+    }
     for name, mod, _, config_src in specs:
         if name not in captured:
             continue
@@ -765,7 +850,7 @@ def _on_the_fly_diffusion_export(
         force_upcast = bool(
             getattr(getattr(config_src, "config", None), "force_upcast", False)
         )
-        if name == "vae_decoder" and force_upcast:
+        if name in _force_fp32 or (name == "vae_decoder" and force_upcast):
             target_module.to(torch.float32)
             mod_dtype = torch.float32
         else:
