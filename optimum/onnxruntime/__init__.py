@@ -8,6 +8,7 @@ from .modeling import (
 )
 from .modeling_diffusion import (
     ORTDiffusionPipeline,
+    ORTImageEditPipeline,
     ORTModelMixin,
     ORTUnet,
     ORTTransformer,
@@ -25,6 +26,7 @@ __all__ = [
     "OnTheFlyORTModelForTokenClassification",
     "OnTheFlyORTModelForQuestionAnswering",
     "ORTDiffusionPipeline",
+    "ORTImageEditPipeline",
     "ORTModelMixin",
     "ORTUnet",
     "ORTTransformer",

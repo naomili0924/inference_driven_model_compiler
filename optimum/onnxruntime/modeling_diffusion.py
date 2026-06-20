@@ -145,9 +145,24 @@ class ORTUnet(ORTModelMixin):
 
         if self.use_io_binding:
             known_output_shapes = load_shapes_as_torch_size(self.io_binding_file)
-            known_output_shapes["out_sample"] = sample.shape
+            # The denoised ``out_sample`` shares its batch and spatial dims with the
+            # input ``sample`` (which vary at inference), but keeps the UNet's own
+            # output channel count. These differ when the pipeline concatenates
+            # conditioning into the sample — e.g. InstructPix2Pix feeds 8 input
+            # channels (noisy latents ⊕ image latents) but predicts 4. Take the
+            # channel dim from the traced output shape and the rest from ``sample``.
+            traced_out = known_output_shapes.get("out_sample")
+            out_shape = list(sample.shape)
+            if traced_out is not None and len(traced_out) == len(out_shape):
+                out_shape[1] = traced_out[1]
+            out_shape = torch.Size(out_shape)
+            known_output_shapes["out_sample"] = out_shape
             known_output_buffers = None
-            if "LatentConsistencyModel" not in self.parent.__class__.__name__:
+            # Reuse the input buffer for the output only when their shapes match
+            # (standard UNets with in_channels == out_channels); otherwise let ORT
+            # allocate a correctly-sized output buffer.
+            if (out_shape == sample.shape
+                    and "LatentConsistencyModel" not in self.parent.__class__.__name__):
                 known_output_buffers = {"out_sample": sample}
             output_shapes, output_buffers = self._prepare_io_binding(
                 model_inputs,
@@ -581,6 +596,34 @@ class _RotaryBakedTransformerWrapper(torch.nn.Module):
         return {"sample": sample}
 
 
+class _VaeEncodeWrapper(torch.nn.Module):
+    """Export wrapper exposing ``AutoencoderKL.encode`` as a plain tensor graph.
+
+    Image-editing / img2img pipelines (e.g. InstructPix2Pix) encode their input
+    image to latents via ``self.vae.encode(image).latent_dist`` — the VAE
+    *encoder* is on the critical path, unlike text-to-image where it is unused.
+
+    The inference tracer hooks ``vae.encoder`` (the inner module), which only
+    yields the pre-``quant_conv`` feature map — not the distribution parameters
+    the pipeline consumes.  This wrapper runs the full encode (encoder, then the
+    optional ``quant_conv``) and returns the moments under the key
+    ``latent_parameters`` — exactly what ``ORTVaeEncoder.forward`` rebuilds into
+    a ``DiagonalGaussianDistribution`` so ``.latent_dist.mode()`` / ``.sample()``
+    work at inference.
+    """
+
+    def __init__(self, vae: torch.nn.Module):
+        super().__init__()
+        self.vae = vae
+
+    def forward(self, sample):
+        h = self.vae.encoder(sample)
+        quant_conv = getattr(self.vae, "quant_conv", None)
+        if quant_conv is not None:
+            h = quant_conv(h)
+        return {"latent_parameters": h}
+
+
 def _on_the_fly_diffusion_export(
     model_name_or_path,
     output,
@@ -658,7 +701,7 @@ def _on_the_fly_diffusion_export(
 
             _vae_full_decode = _VaeFullDecodeWrapper(_pqc, _dec)
             specs.append(("vae_decoder", _pqc, DIFFUSION_MODEL_VAE_DECODER_SUBFOLDER, vae))
-            _export_overrides = {"vae_decoder": _vae_full_decode}
+            _export_overrides["vae_decoder"] = _vae_full_decode
 
         elif _dec is not None:
             # CogVideoX-style: post_quant_conv is None; decoder is called directly
@@ -676,9 +719,15 @@ def _on_the_fly_diffusion_export(
 
             _vae_full_decode = _VaeNoQuantDecodeWrapper(_dec)
             specs.append(("vae_decoder", _dec, DIFFUSION_MODEL_VAE_DECODER_SUBFOLDER, vae))
-            _export_overrides = {"vae_decoder": _vae_full_decode}
-        else:
-            _export_overrides = {}
+            _export_overrides["vae_decoder"] = _vae_full_decode
+
+        # The inner ``vae.encoder`` is captured above, but its bare feature map
+        # is not the latent distribution the pipeline consumes. Export the full
+        # encode (encoder + quant_conv) so the ONNX graph emits ``latent_parameters``.
+        # Only image-editing / img2img pipelines actually invoke the encoder during
+        # the traced pass; for text-to-image it is captured-but-unused and harmless.
+        if getattr(vae, "encoder", None) is not None:
+            _export_overrides["vae_encoder"] = _VaeEncodeWrapper(vae)
 
     # 3. Register forward pre-hooks to capture each submodule's first-call inputs.
     # We snapshot (deep-copy) values immediately — some models (e.g. WanDecoder3d)
@@ -775,6 +824,19 @@ def _on_the_fly_diffusion_export(
             cap[target_key] = cap.pop(tensor_keys[0])
             captured["vae_decoder"] = cap
 
+    # Same normalization for the vae_encoder: the hook records the input under the
+    # inner encoder's first parameter name, but _VaeEncodeWrapper.forward expects
+    # it under "sample".
+    if "vae_encoder" in captured and "vae_encoder" in _export_overrides:
+        wrapper = _export_overrides["vae_encoder"]
+        wrapper_params = list(inspect.signature(wrapper.forward).parameters)
+        target_key = wrapper_params[0] if wrapper_params else None
+        cap = captured["vae_encoder"]
+        tensor_keys = [k for k, v in cap.items() if torch.is_tensor(v)]
+        if target_key and tensor_keys and tensor_keys[0] != target_key:
+            cap[target_key] = cap.pop(tensor_keys[0])
+            captured["vae_encoder"] = cap
+
     # 4b. Register export wrappers for UNet-based (SDXL-style) pipelines.
     #
     #  • UNet: lift the nested ``added_cond_kwargs`` dict (text_embeds + time_ids)
@@ -794,12 +856,18 @@ def _on_the_fly_diffusion_export(
             for k, v in added.items():
                 if torch.is_tensor(v):
                     cap[k] = v
-        # Only wrap when the UNet actually consumes added_cond_kwargs; otherwise
-        # the plain UNet export (SD1.x-style) already works.
-        if isinstance(added, dict) and any(torch.is_tensor(v) for v in added.values()):
-            _export_overrides[unet_name] = _UnetAddedCondWrapper(
-                _modules_by_name[unet_name]
-            ).to(export_device)
+        # Always export UNet denoisers through the wrapper. Besides lifting any
+        # SDXL-style added_cond tensors (text_embeds/time_ids) into first-class
+        # inputs, the wrapper returns the denoised tensor under the name
+        # ``out_sample`` — distinct from the ``sample`` input. A plain UNet's
+        # output dataclass field is also called ``sample``, which collides with
+        # the input name and makes torch.onnx rename the input to ``sample.1``,
+        # breaking ORTUnet.forward (which feeds the input as ``sample``). The
+        # wrapper passes ``added_cond_kwargs=None`` for SD-1.x-style UNets, so it
+        # is a no-op there beyond fixing the output name.
+        _export_overrides[unet_name] = _UnetAddedCondWrapper(
+            _modules_by_name[unet_name]
+        ).to(export_device)
 
     for te_name in ("text_encoder", "text_encoder_2", "text_encoder_3"):
         cap = captured.get(te_name)
@@ -1025,18 +1093,23 @@ def _on_the_fly_diffusion_export(
         )
 
 
-def _make_ort_pipeline_class(diffusers_class: type) -> type:
+def _make_ort_pipeline_class(diffusers_class: type, base: type | None = None) -> type:
     """Dynamically create an ORT pipeline class for any diffusers pipeline.
 
-    Returns a class that inherits from both ORTDiffusionPipeline and the given
-    diffusers pipeline class, so it runs inference via ONNX Runtime while
-    keeping the full diffusers pipeline API (schedulers, tokenizers, etc.).
+    Returns a class that inherits from both *base* (an ORT pipeline class,
+    defaulting to ``ORTDiffusionPipeline``) and the given diffusers pipeline
+    class, so it runs inference via ONNX Runtime while keeping the full diffusers
+    pipeline API (schedulers, tokenizers, etc.).
 
-    No manual subclass is needed when a new diffusers pipeline is released.
+    Passing a more specific *base* (e.g. ``ORTImageEditPipeline``) preserves that
+    base's behaviour and identity while still mixing in the concrete diffusers
+    pipeline resolved from the checkpoint.  No manual subclass is needed when a
+    new diffusers pipeline is released.
     """
+    base = base or ORTDiffusionPipeline
     return type(
         f"ORT{diffusers_class.__name__}",
-        (ORTDiffusionPipeline, diffusers_class),
+        (base, diffusers_class),
         {"auto_model_class": diffusers_class, "task": "auto"},
     )
 
@@ -1270,6 +1343,10 @@ class ORTDiffusionPipeline(ORTParentMixin, DiffusionPipeline):
         if not model_save_path.is_dir():
             all_components = {key for key in config if not key.startswith("_")} | {"vae_encoder", "vae_decoder"}
             allow_patterns = {os.path.join(component, "*") for component in all_components}
+            # Also fetch the io_binding/ output-shape files — without them ORT
+            # falls back to evaluating the graph's symbolic output dims at
+            # inference (e.g. "Conv…_dim_2"), which raises a NameError.
+            allow_patterns.add(os.path.join("io_binding", "*"))
             allow_patterns.update({
                 ONNX_WEIGHTS_NAME, DIFFUSION_PIPELINE_CONFIG_FILE_NAME,
                 SCHEDULER_CONFIG_NAME, CONFIG_NAME,
@@ -1321,18 +1398,32 @@ class ORTDiffusionPipeline(ORTParentMixin, DiffusionPipeline):
                     submodels[submodel] = class_obj.from_pretrained(model_save_path)
 
         # Resolve the concrete pipeline class dynamically — no hardcoded mapping needed.
-        # For any new diffusers pipeline, the right ORT class is created on the fly.
-        if cls is ORTDiffusionPipeline:
+        # A "base" ORT pipeline (``ORTDiffusionPipeline`` itself, or a named subclass
+        # like ``ORTImageEditPipeline`` that does not yet mix in a real diffusers
+        # pipeline) is specialized on the fly from the checkpoint's ``_class_name``,
+        # mixing the concrete diffusers pipeline into *this* class so its API and any
+        # overrides are preserved. An already-concrete class is used as-is.
+        is_concrete = (
+            cls.auto_model_class is not DiffusionPipeline
+            and issubclass(cls, cls.auto_model_class)
+        )
+        if is_concrete:
+            ort_pipeline_class = cls
+        else:
             pipeline_class_name = config["_class_name"]
             diffusers_class = getattr(diffusers, pipeline_class_name, None)
+            # A pipeline persisted via save_pretrained records the *ORT* wrapper
+            # class name (e.g. "ORTStableDiffusionInstructPix2PixPipeline"), which
+            # is not a real diffusers class. Recover the underlying diffusers
+            # pipeline by stripping the "ORT" prefix.
+            if diffusers_class is None and pipeline_class_name.startswith("ORT"):
+                diffusers_class = getattr(diffusers, pipeline_class_name[3:], None)
             if diffusers_class is None:
                 raise ValueError(
                     f"Pipeline class '{pipeline_class_name}' not found in diffusers. "
                     f"Make sure diffusers is up to date."
                 )
-            ort_pipeline_class = _make_ort_pipeline_class(diffusers_class)
-        else:
-            ort_pipeline_class = cls
+            ort_pipeline_class = _make_ort_pipeline_class(diffusers_class, base=cls)
 
         ort_pipeline = ort_pipeline_class(
             **sessions,
@@ -1358,7 +1449,30 @@ class ORTDiffusionPipeline(ORTParentMixin, DiffusionPipeline):
 
         return ort_pipeline
 
-    def save_pretrained(self, save_directory: str | Path, push_to_hub: bool = False, **kwargs):
+    def save_pretrained(
+        self,
+        save_directory: str | Path,
+        push_to_hub: bool = False,
+        repo_id: str | None = None,
+        token: str | None = None,
+        private: bool = False,
+        commit_message: str | None = None,
+        **kwargs,
+    ):
+        """Save every exported ONNX submodule + configs to ``save_directory``.
+
+        When ``push_to_hub=True`` the saved folder is uploaded to the Hugging Face
+        Hub repo ``repo_id`` (created if absent). The repo can later be reloaded
+        with ``from_pretrained(repo_id, export=False)`` — no re-export needed.
+
+        Args:
+            push_to_hub: Upload the saved folder to the Hub after saving locally.
+            repo_id: Target Hub repo, e.g. ``"username/instruct-pix2pix-onnx"``.
+                Defaults to the directory name when not given.
+            token: Hub access token (write scope). Falls back to the cached login.
+            private: Create the repo as private when it does not already exist.
+            commit_message: Commit message for the upload.
+        """
         model_save_path = Path(save_directory)
         model_save_path.mkdir(parents=True, exist_ok=True)
 
@@ -1382,3 +1496,124 @@ class ORTDiffusionPipeline(ORTParentMixin, DiffusionPipeline):
             component = getattr(self, attr, None)
             if component is not None:
                 component.save_pretrained(model_save_path / attr)
+
+        # Persist the IO-binding output-shape files. Without them a reloaded
+        # pipeline cannot bind submodule outputs and falls back to resolving the
+        # graph's symbolic output dims (e.g. "Conv…_dim_2"), which fails.
+        io_dir = model_save_path / "io_binding"
+        for key, comp in self.components.items():
+            parts = [comp.encoder, comp.decoder] if key == "vae" else [comp]
+            for part in parts:
+                src = getattr(part, "io_binding_file", None)
+                if src and Path(src).is_file():
+                    io_dir.mkdir(exist_ok=True)
+                    (io_dir / Path(src).name).write_bytes(Path(src).read_bytes())
+
+        if push_to_hub:
+            from huggingface_hub import HfApi
+
+            target_repo = repo_id or model_save_path.name
+            api = HfApi(token=token, user_agent=http_user_agent())
+            api.create_repo(repo_id=target_repo, repo_type="model",
+                            private=private, exist_ok=True)
+            api.upload_folder(
+                folder_path=str(model_save_path),
+                repo_id=target_repo,
+                repo_type="model",
+                commit_message=commit_message or "Upload inference-driven ONNX export",
+            )
+            logger.info("Uploaded ONNX pipeline to https://huggingface.co/%s", target_repo)
+
+
+# Diffusers pipeline classes whose primary conditioning is an input image to be
+# edited/transformed (rather than pure text-to-image). Used only for a friendly
+# warning — any image-conditioned diffusers pipeline exports and runs through
+# ORTImageEditPipeline via the same on-the-fly class resolution.
+IMAGE_EDIT_PIPELINE_CLASSES = {
+    "StableDiffusionInstructPix2PixPipeline",
+    "StableDiffusionXLInstructPix2PixPipeline",
+    "StableDiffusionImg2ImgPipeline",
+    "StableDiffusionXLImg2ImgPipeline",
+    "StableDiffusionUpscalePipeline",
+    "StableDiffusionDepth2ImgPipeline",
+    "LEditsPPPipelineStableDiffusion",
+    "LEditsPPPipelineStableDiffusionXL",
+    "KandinskyImg2ImgPipeline",
+}
+
+
+class ORTImageEditPipeline(ORTDiffusionPipeline):
+    """ONNX Runtime pipeline for image-editing diffusion models.
+
+    Image-editing models (e.g. ``timbrooks/instruct-pix2pix``) take an input
+    image plus a text instruction and produce an edited image.  They differ from
+    text-to-image models in two ways this pipeline relies on:
+
+      * the **VAE encoder** is on the critical path — the input image is encoded
+        to latents via ``vae.encode(image).latent_dist`` — whereas text-to-image
+        never touches it, and
+      * the **UNet** consumes the noisy latents concatenated with the encoded
+        image latents (InstructPix2Pix's UNet has ``in_channels == 8``).
+
+    Both are captured automatically by the inference-driven export: pass an
+    ``image`` (and a ``prompt``) in ``inference_kwargs`` so the single tracing
+    pass exercises the VAE encoder and the wide UNet, then every submodule is
+    exported to ONNX at the traced resolution.
+
+    Usage::
+
+        import torch
+        from PIL import Image
+        from inference_driven_model_compiler.optimum.onnxruntime import (
+            ORTImageEditPipeline,
+        )
+
+        inf_kwargs = {
+            "prompt": "turn it into a Van Gogh painting",
+            "image": Image.open("input.png").convert("RGB"),
+            "num_inference_steps": 10,
+            "image_guidance_scale": 1.5,
+            "guidance_scale": 7.5,
+        }
+        pipe = ORTImageEditPipeline.from_pretrained(
+            "timbrooks/instruct-pix2pix",
+            provider="CUDAExecutionProvider",
+            torch_dtype=torch.float32,
+            inference_kwargs=inf_kwargs,
+            export_by_inference=True,
+        )
+        edited = pipe(**inf_kwargs).images[0]
+        edited.save("edited.png")
+
+    The concrete diffusers pipeline is resolved from the checkpoint's
+    ``_class_name`` and mixed into this class on the fly, so any image-editing
+    pipeline in diffusers works without a model-specific subclass.
+    """
+
+    # Stays as DiffusionPipeline so from_pretrained specializes this class on the
+    # fly from the checkpoint's _class_name (see ORTDiffusionPipeline.from_pretrained).
+    auto_model_class = DiffusionPipeline
+
+    @classmethod
+    def from_pretrained(cls, model_name_or_path: str | Path, *args, **kwargs):
+        # Soft check: warn (don't fail) if this isn't a known image-editing model,
+        # so a text-to-image checkpoint is steered toward ORTDiffusionPipeline.
+        if cls is ORTImageEditPipeline:
+            try:
+                cfg = cls.load_config(model_name_or_path)
+                cfg = cfg[0] if isinstance(cfg, tuple) else cfg
+                pipe_cls = cfg.get("_class_name")
+                # A persisted copy records the "ORT…"-prefixed wrapper name; compare
+                # against the underlying diffusers pipeline name.
+                if pipe_cls and pipe_cls.startswith("ORT"):
+                    pipe_cls = pipe_cls[3:]
+                if pipe_cls and pipe_cls not in IMAGE_EDIT_PIPELINE_CLASSES:
+                    logger.warning(
+                        "'%s' is a '%s', which is not a recognized image-editing "
+                        "pipeline. ORTImageEditPipeline will still attempt the "
+                        "export, but for pure text-to-image use ORTDiffusionPipeline.",
+                        model_name_or_path, pipe_cls,
+                    )
+            except Exception:
+                pass
+        return super().from_pretrained(model_name_or_path, *args, **kwargs)

@@ -257,9 +257,110 @@ This exports four ONNX submodules and immediately loads them into ORT sessions:
 > pipeline's device. Use a CUDA provider for large UNet-based models — exporting
 > an fp16 UNet/VAE on CPU is extremely slow.
 
+### Diffusion pipeline (image editing)
+
+Image-editing models — e.g. **InstructPix2Pix** (`timbrooks/instruct-pix2pix`) —
+take an **input image plus a text instruction** and produce an edited image.
+`ORTImageEditPipeline` handles the two things that make them different from
+text-to-image:
+
+- the input image is encoded to latents through the **VAE encoder**
+  (`vae.encode(image).latent_dist`), which text-to-image never touches, and
+- the **UNet** consumes the noisy latents *concatenated with* the encoded image
+  latents (InstructPix2Pix's UNet has `in_channels == 8`).
+
+Pass an `image` (and a `prompt`) in `inference_kwargs` so the single tracing
+pass exercises the VAE encoder and the wide UNet — then every submodule is
+exported to ONNX at the traced resolution.
+
+```python
+import torch
+from PIL import Image
+from inference_driven_model_compiler.optimum.onnxruntime import ORTImageEditPipeline
+
+inf_kwargs = {
+    "prompt": "turn him into a cyborg",
+    "image": Image.open("input.png").convert("RGB"),  # any RGB image
+    "num_inference_steps": 10,
+    "image_guidance_scale": 1.5,
+    "guidance_scale": 7.5,
+}
+
+pipe = ORTImageEditPipeline.from_pretrained(
+    "timbrooks/instruct-pix2pix",
+    provider="CUDAExecutionProvider",
+    torch_dtype=torch.float32,
+    export_by_inference=True,
+    inference_kwargs=inf_kwargs,
+)
+
+edited = pipe(**inf_kwargs).images[0]
+edited.save("edited.png")
+```
+
+This exports four ONNX submodules (note the **`vae_encoder`**, exported as the
+full `encode` graph — encoder + `quant_conv` → `latent_parameters` — so the input
+image becomes a proper latent distribution):
+
+| Submodule | ONNX file | Notes |
+|---|---|---|
+| `text_encoder` | `text_encoder/model.onnx` | single CLIP encoder (SD-1.5) |
+| `unet` | `unet/model.onnx` (+ `model.onnx_data`) | 8-channel input (latents ⊕ image latents) |
+| `vae_encoder` | `vae_encoder/model.onnx` | encodes the input image → `latent_dist` |
+| `vae_decoder` | `vae_decoder/model.onnx` | decodes the final latents → image |
+
+The concrete diffusers pipeline is resolved from the checkpoint's `_class_name`
+and mixed into `ORTImageEditPipeline` on the fly, so other image-conditioned
+pipelines (img2img, SDXL InstructPix2Pix, upscaling, …) export and run through
+the same class without a model-specific subclass. For pure text-to-image, use
+`ORTDiffusionPipeline` instead.
+
+> InstructPix2Pix uses the SD-1.5 VAE, which is fp16-fragile on some images.
+> The example above exports in **fp32** (the model is small, ~1 GB); switch to
+> `torch_dtype=torch.float16` for a faster/smaller export once you've confirmed
+> the output quality on your inputs.
+
+### Saving & uploading the exported ONNX to the Hub
+
+`export_by_inference=True` writes the ONNX graphs to ephemeral RAM (`/dev/shm`)
+and re-exports on every call. To keep them — and reuse them without re-exporting
+— save the pipeline to disk and/or push it to the Hugging Face Hub:
+
+```python
+# 1. Export once...
+pipe = ORTImageEditPipeline.from_pretrained(
+    "timbrooks/instruct-pix2pix",
+    provider="CUDAExecutionProvider", torch_dtype=torch.float32,
+    export_by_inference=True, inference_kwargs=inf_kwargs,
+)
+
+# 2. ...then persist locally and/or upload to your Hub repo.
+pipe.save_pretrained(
+    "instruct-pix2pix-onnx",          # local copy
+    push_to_hub=True,
+    repo_id="your-username/instruct-pix2pix-onnx",
+    token="hf_…",                     # write-scoped token (or use the cached login)
+    private=True,
+)
+```
+
+`save_pretrained` writes every submodule's `model.onnx` (+ external `.onnx_data`
+for graphs over 2 GB), the per-submodule `config.json`, the `scheduler/` /
+`tokenizer/` / `feature_extractor/`, the `model_index.json`, and the
+`io_binding/` output-shape files — everything needed to reload without tracing.
+
 ### Loading pre-exported ONNX weights
 
 ```python
+# From a local directory or a Hub repo — no PyTorch, no re-export.
+pipe = ORTImageEditPipeline.from_pretrained(
+    "your-username/instruct-pix2pix-onnx",   # or a local path
+    export=False,
+    provider="CUDAExecutionProvider",
+)
+edited = pipe(**inf_kwargs).images[0]
+
+# Generic text-to-image works the same way:
 pipe = ORTDiffusionPipeline.from_pretrained(
     "optimum/stable-diffusion-v1-5",   # Hub repo with pre-exported ONNX weights
     export=False,
@@ -300,6 +401,7 @@ same `from_pretrained(...)` interface:
 | Class | Purpose |
 |---|---|
 | `ORTDiffusionPipeline` | Generic base — wraps **any** `diffusers.DiffusionPipeline` |
+| `ORTImageEditPipeline` | Image-editing models (InstructPix2Pix, img2img, …) — encodes an input image via the VAE encoder |
 | `ORTUnet` | ORT session wrapper for a UNet2D/3D denoiser |
 | `ORTTransformer` | ORT session wrapper for a DiT/transformer denoiser |
 | `ORTTextEncoder` | ORT session wrapper for a text encoder |
@@ -342,6 +444,7 @@ Supported text-to-video pipeline names (as of diffusers 0.38):
 |---|---|---|---|
 | Wan2.1-T2V-1.3B | `WanPipeline` | text_encoder, transformer, vae_decoder | Verified end-to-end on CUDA; 50-step inference at ~7.4 it/s |
 | SDXL-Turbo | `StableDiffusionXLPipeline` | text_encoder, text_encoder_2, unet, vae_decoder | Text-to-image; verified end-to-end on CUDA (1-step). VAE decoder exported in fp32. |
+| InstructPix2Pix | `StableDiffusionInstructPix2PixPipeline` | text_encoder, unet, **vae_encoder**, vae_decoder | Image editing via `ORTImageEditPipeline`; verified end-to-end on CUDA (fp32, 10-step ~9.7 it/s). Exercises the VAE **encoder** (input image → latents) and the 8-channel UNet. Save→Hub→reload round-trip verified. |
 
 ---
 
