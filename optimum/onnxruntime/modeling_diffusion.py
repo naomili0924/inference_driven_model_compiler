@@ -60,7 +60,7 @@ class ORTModelMixin(ORTSessionMixin, ConfigMixin, CacheMixin):
     def __init__(
         self,
         session: InferenceSession,
-        parent: "ORTDiffusionPipeline",
+        parent: "OnTheFlyORTDiffusionPipeline",
         use_io_binding: bool | None = None,
     ):
         self.initialize_ort_attributes(session, use_io_binding=use_io_binding)
@@ -1077,7 +1077,7 @@ def _on_the_fly_diffusion_export(
         elif hasattr(mod, "config") and hasattr(mod.config, "save_pretrained"):
             mod.config.save_pretrained(str(out_sub))
 
-    # 8. Save pipeline-level components so ORTDiffusionPipeline can load them
+    # 8. Save pipeline-level components so OnTheFlyORTDiffusionPipeline can load them
     pt_pipeline.save_config(output)
     for attr in ("scheduler", "tokenizer", "tokenizer_2", "tokenizer_3", "feature_extractor"):
         comp = getattr(pt_pipeline, attr, None)
@@ -1097,16 +1097,16 @@ def _make_ort_pipeline_class(diffusers_class: type, base: type | None = None) ->
     """Dynamically create an ORT pipeline class for any diffusers pipeline.
 
     Returns a class that inherits from both *base* (an ORT pipeline class,
-    defaulting to ``ORTDiffusionPipeline``) and the given diffusers pipeline
+    defaulting to ``OnTheFlyORTDiffusionPipeline``) and the given diffusers pipeline
     class, so it runs inference via ONNX Runtime while keeping the full diffusers
     pipeline API (schedulers, tokenizers, etc.).
 
-    Passing a more specific *base* (e.g. ``ORTImageEditPipeline``) preserves that
+    Passing a more specific *base* (e.g. ``OnTheFlyORTImageEditPipeline``) preserves that
     base's behaviour and identity while still mixing in the concrete diffusers
     pipeline resolved from the checkpoint.  No manual subclass is needed when a
     new diffusers pipeline is released.
     """
-    base = base or ORTDiffusionPipeline
+    base = base or OnTheFlyORTDiffusionPipeline
     return type(
         f"ORT{diffusers_class.__name__}",
         (base, diffusers_class),
@@ -1114,7 +1114,7 @@ def _make_ort_pipeline_class(diffusers_class: type, base: type | None = None) ->
     )
 
 
-class ORTDiffusionPipeline(ORTParentMixin, DiffusionPipeline):
+class OnTheFlyORTDiffusionPipeline(ORTParentMixin, DiffusionPipeline):
     """Generic ONNX Runtime pipeline for any diffusers DiffusionPipeline.
 
     Export any diffusers pipeline to ONNX and run it with ONNX Runtime — no
@@ -1123,7 +1123,7 @@ class ORTDiffusionPipeline(ORTParentMixin, DiffusionPipeline):
 
     Usage::
 
-        pipe = ORTDiffusionPipeline.from_pretrained(
+        pipe = OnTheFlyORTDiffusionPipeline.from_pretrained(
             "runwayml/stable-diffusion-v1-5",
             export=True,
         )
@@ -1398,8 +1398,8 @@ class ORTDiffusionPipeline(ORTParentMixin, DiffusionPipeline):
                     submodels[submodel] = class_obj.from_pretrained(model_save_path)
 
         # Resolve the concrete pipeline class dynamically — no hardcoded mapping needed.
-        # A "base" ORT pipeline (``ORTDiffusionPipeline`` itself, or a named subclass
-        # like ``ORTImageEditPipeline`` that does not yet mix in a real diffusers
+        # A "base" ORT pipeline (``OnTheFlyORTDiffusionPipeline`` itself, or a named subclass
+        # like ``OnTheFlyORTImageEditPipeline`` that does not yet mix in a real diffusers
         # pipeline) is specialized on the fly from the checkpoint's ``_class_name``,
         # mixing the concrete diffusers pipeline into *this* class so its API and any
         # overrides are preserved. An already-concrete class is used as-is.
@@ -1528,7 +1528,7 @@ class ORTDiffusionPipeline(ORTParentMixin, DiffusionPipeline):
 # Diffusers pipeline classes whose primary conditioning is an input image to be
 # edited/transformed (rather than pure text-to-image). Used only for a friendly
 # warning — any image-conditioned diffusers pipeline exports and runs through
-# ORTImageEditPipeline via the same on-the-fly class resolution.
+# OnTheFlyORTImageEditPipeline via the same on-the-fly class resolution.
 IMAGE_EDIT_PIPELINE_CLASSES = {
     "StableDiffusionInstructPix2PixPipeline",
     "StableDiffusionXLInstructPix2PixPipeline",
@@ -1542,7 +1542,7 @@ IMAGE_EDIT_PIPELINE_CLASSES = {
 }
 
 
-class ORTImageEditPipeline(ORTDiffusionPipeline):
+class OnTheFlyORTImageEditPipeline(OnTheFlyORTDiffusionPipeline):
     """ONNX Runtime pipeline for image-editing diffusion models.
 
     Image-editing models (e.g. ``timbrooks/instruct-pix2pix``) take an input
@@ -1565,7 +1565,7 @@ class ORTImageEditPipeline(ORTDiffusionPipeline):
         import torch
         from PIL import Image
         from inference_driven_model_compiler.optimum.onnxruntime import (
-            ORTImageEditPipeline,
+            OnTheFlyORTImageEditPipeline,
         )
 
         inf_kwargs = {
@@ -1575,7 +1575,7 @@ class ORTImageEditPipeline(ORTDiffusionPipeline):
             "image_guidance_scale": 1.5,
             "guidance_scale": 7.5,
         }
-        pipe = ORTImageEditPipeline.from_pretrained(
+        pipe = OnTheFlyORTImageEditPipeline.from_pretrained(
             "timbrooks/instruct-pix2pix",
             provider="CUDAExecutionProvider",
             torch_dtype=torch.float32,
@@ -1591,14 +1591,14 @@ class ORTImageEditPipeline(ORTDiffusionPipeline):
     """
 
     # Stays as DiffusionPipeline so from_pretrained specializes this class on the
-    # fly from the checkpoint's _class_name (see ORTDiffusionPipeline.from_pretrained).
+    # fly from the checkpoint's _class_name (see OnTheFlyORTDiffusionPipeline.from_pretrained).
     auto_model_class = DiffusionPipeline
 
     @classmethod
     def from_pretrained(cls, model_name_or_path: str | Path, *args, **kwargs):
         # Soft check: warn (don't fail) if this isn't a known image-editing model,
-        # so a text-to-image checkpoint is steered toward ORTDiffusionPipeline.
-        if cls is ORTImageEditPipeline:
+        # so a text-to-image checkpoint is steered toward OnTheFlyORTDiffusionPipeline.
+        if cls is OnTheFlyORTImageEditPipeline:
             try:
                 cfg = cls.load_config(model_name_or_path)
                 cfg = cfg[0] if isinstance(cfg, tuple) else cfg
@@ -1610,10 +1610,18 @@ class ORTImageEditPipeline(ORTDiffusionPipeline):
                 if pipe_cls and pipe_cls not in IMAGE_EDIT_PIPELINE_CLASSES:
                     logger.warning(
                         "'%s' is a '%s', which is not a recognized image-editing "
-                        "pipeline. ORTImageEditPipeline will still attempt the "
-                        "export, but for pure text-to-image use ORTDiffusionPipeline.",
+                        "pipeline. OnTheFlyORTImageEditPipeline will still attempt the "
+                        "export, but for pure text-to-image use OnTheFlyORTDiffusionPipeline.",
                         model_name_or_path, pipe_cls,
                     )
             except Exception:
                 pass
         return super().from_pretrained(model_name_or_path, *args, **kwargs)
+
+
+# ── Deprecated aliases ────────────────────────────────────────────────────────
+# These pipelines were originally named without the ``OnTheFly`` prefix. The
+# prefix now consistently marks every inference-driven (on-the-fly export) entry
+# point. The old names remain importable so existing code keeps working.
+ORTDiffusionPipeline = OnTheFlyORTDiffusionPipeline
+ORTImageEditPipeline = OnTheFlyORTImageEditPipeline

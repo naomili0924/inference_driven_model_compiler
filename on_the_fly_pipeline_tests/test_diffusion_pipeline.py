@@ -3,7 +3,7 @@
 These tests cover:
   1. Dynamic class creation via _make_ort_pipeline_class for every
      text-to-video pipeline currently in diffusers.
-  2. ORTDiffusionPipeline.from_pretrained with fully-mocked I/O (no GPU,
+  2. OnTheFlyORTDiffusionPipeline.from_pretrained with fully-mocked I/O (no GPU,
      no model download).
   3. save_pretrained round-trip.
   4. ORTTransformer / ORTTextEncoder / ORTVaeDecoder forward pass with
@@ -32,7 +32,7 @@ sys.path.insert(0, "/workspace")
 
 import diffusers
 from inference_driven_model_compiler.optimum.onnxruntime.modeling_diffusion import (
-    ORTDiffusionPipeline,
+    OnTheFlyORTDiffusionPipeline,
     ORTModelMixin,
     ORTTransformer,
     ORTTextEncoder,
@@ -171,8 +171,8 @@ class TestMakeORTPipelineClass(unittest.TestCase):
         ort_class = _make_ort_pipeline_class(diffusers_class)
 
         self.assertEqual(ort_class.__name__, f"ORT{name}")
-        self.assertTrue(issubclass(ort_class, ORTDiffusionPipeline),
-                        f"ORT{name} should inherit from ORTDiffusionPipeline")
+        self.assertTrue(issubclass(ort_class, OnTheFlyORTDiffusionPipeline),
+                        f"ORT{name} should inherit from OnTheFlyORTDiffusionPipeline")
         self.assertTrue(issubclass(ort_class, diffusers_class),
                         f"ORT{name} should inherit from {name}")
         self.assertIs(ort_class.auto_model_class, diffusers_class)
@@ -202,7 +202,7 @@ class TestDynamicClassCoverage(unittest.TestCase):
         FuturePipeline = type("FuturePipeline", (diffusers.DiffusionPipeline,), {})
         ort_class = _make_ort_pipeline_class(FuturePipeline)
         self.assertEqual(ort_class.__name__, "ORTFuturePipeline")
-        self.assertTrue(issubclass(ort_class, ORTDiffusionPipeline))
+        self.assertTrue(issubclass(ort_class, OnTheFlyORTDiffusionPipeline))
         self.assertTrue(issubclass(ort_class, FuturePipeline))
 
     def test_all_text_to_video_present_in_diffusers(self):
@@ -212,13 +212,13 @@ class TestDynamicClassCoverage(unittest.TestCase):
                          f"Pipelines missing from diffusers {diffusers.__version__}: {missing}")
 
     def test_mro_order(self):
-        """ORTDiffusionPipeline appears before the diffusers class in the MRO."""
+        """OnTheFlyORTDiffusionPipeline appears before the diffusers class in the MRO."""
         ort_cls = _make_ort_pipeline_class(diffusers.WanPipeline)
         mro = ort_cls.__mro__
-        ort_idx = mro.index(ORTDiffusionPipeline)
+        ort_idx = mro.index(OnTheFlyORTDiffusionPipeline)
         diffusers_idx = mro.index(diffusers.WanPipeline)
         self.assertLess(ort_idx, diffusers_idx,
-                        "ORTDiffusionPipeline must come before WanPipeline in MRO")
+                        "OnTheFlyORTDiffusionPipeline must come before WanPipeline in MRO")
 
 
 # ── Suite 2: Text-to-video pipeline class creation ────────────────────────────
@@ -233,7 +233,7 @@ class TestTextToVideoPipelineClasses(unittest.TestCase):
         ort = _make_ort_pipeline_class(cls)
         self.assertEqual(ort.__name__, f"ORT{name}")
         self.assertTrue(issubclass(ort, cls))
-        self.assertTrue(issubclass(ort, ORTDiffusionPipeline))
+        self.assertTrue(issubclass(ort, OnTheFlyORTDiffusionPipeline))
 
     def test_wan_pipeline(self):           self._assert_ort_wraps("WanPipeline")
     def test_wan_animate_pipeline(self):   self._assert_ort_wraps("WanAnimatePipeline")
@@ -299,7 +299,7 @@ class TestFromPretrainedMocked(unittest.TestCase):
         # Stub diffusers.__init__ so we don't need a real unet.config.sample_size etc.
         with patch.object(diffusers.StableDiffusionPipeline, "__init__",
                           lambda self, **kw: None):
-            with patch.object(ORTDiffusionPipeline, "load_config",
+            with patch.object(OnTheFlyORTDiffusionPipeline, "load_config",
                               return_value={
                                   "_class_name": "StableDiffusionPipeline",
                                   "_diffusers_version": "0.38.0",
@@ -310,20 +310,20 @@ class TestFromPretrainedMocked(unittest.TestCase):
                                   "tokenizer_3": (None, None),
                                   "feature_extractor": (None, None),
                               }):
-                with patch.object(ORTDiffusionPipeline, "register_to_config"):
+                with patch.object(OnTheFlyORTDiffusionPipeline, "register_to_config"):
                     unet_sess = self._make_sess(
                         "unet",
                         ["sample", "timestep", "encoder_hidden_states"],
                         ["out_sample"],
                     )
-                    pipe = ORTDiffusionPipeline.from_pretrained(
+                    pipe = OnTheFlyORTDiffusionPipeline.from_pretrained(
                         self.tmpdir,
                         export=False,
                         unet_session=unet_sess,
                     )
 
         self.assertEqual(type(pipe).__name__, "ORTStableDiffusionPipeline")
-        self.assertIsInstance(pipe, ORTDiffusionPipeline)
+        self.assertIsInstance(pipe, OnTheFlyORTDiffusionPipeline)
         self.assertIsInstance(pipe, diffusers.StableDiffusionPipeline)
 
     @_PATCH_IO_BINDING
@@ -368,7 +368,7 @@ class TestFromPretrainedMocked(unittest.TestCase):
         mock_ort_session.side_effect = lambda path, **kw: _mock_session(
             input_names=["sample"], output_names=["out_sample"], model_path=path,
         )
-        with patch.object(ORTDiffusionPipeline, "load_config",
+        with patch.object(OnTheFlyORTDiffusionPipeline, "load_config",
                           return_value={
                               "_class_name": "NonExistentXYZPipeline",
                               "_diffusers_version": "0.38.0",
@@ -380,7 +380,7 @@ class TestFromPretrainedMocked(unittest.TestCase):
                               "feature_extractor": (None, None),
                           }):
             with self.assertRaises(ValueError, msg="Should raise for unknown pipeline class"):
-                ORTDiffusionPipeline.from_pretrained(self.tmpdir, export=False)
+                OnTheFlyORTDiffusionPipeline.from_pretrained(self.tmpdir, export=False)
 
 
 # ── Suite 4: Submodule forward pass ───────────────────────────────────────────
@@ -594,7 +594,7 @@ class TestSDXLExportWrappers(unittest.TestCase):
             self.skipTest("StableDiffusionXLPipeline not in diffusers")
         ort = _make_ort_pipeline_class(cls)
         self.assertEqual(ort.__name__, "ORTStableDiffusionXLPipeline")
-        self.assertTrue(issubclass(ort, ORTDiffusionPipeline))
+        self.assertTrue(issubclass(ort, OnTheFlyORTDiffusionPipeline))
         self.assertTrue(issubclass(ort, cls))
 
     def test_unet_added_cond_wrapper(self):

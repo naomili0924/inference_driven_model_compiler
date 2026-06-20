@@ -12,7 +12,7 @@ import time
 
 import torch
 
-from inference_driven_model_compiler.optimum.onnxruntime import ORTImageEditPipeline
+from inference_driven_model_compiler.optimum.onnxruntime import OnTheFlyORTImageEditPipeline
 
 EXPORT_DIR = "/dev/shm"                       # where export_by_inference wrote the ONNX
 SAVE_DIR = "/workspace/ip2p-onnx"             # persistent on-disk copy
@@ -47,7 +47,7 @@ inf_kwargs = {
 
 # 1. Load the already-exported graphs (no re-export).
 t0 = time.time()
-pipe = ORTImageEditPipeline.from_pretrained(
+pipe = OnTheFlyORTImageEditPipeline.from_pretrained(
     EXPORT_DIR, export=False, provider=provider, torch_dtype=torch.float32,
 )
 print(f"[1] Loaded from {EXPORT_DIR} (export=False) in {time.time()-t0:.1f}s "
@@ -61,7 +61,7 @@ print(f"[2] save_pretrained -> {SAVE_DIR} in {time.time()-t0:.1f}s")
 # 3. Reload from the persistent copy, again without re-exporting.
 del pipe
 t0 = time.time()
-pipe2 = ORTImageEditPipeline.from_pretrained(
+pipe2 = OnTheFlyORTImageEditPipeline.from_pretrained(
     SAVE_DIR, export=False, provider=provider, torch_dtype=torch.float32,
 )
 print(f"[3] Reloaded from {SAVE_DIR} (export=False) in {time.time()-t0:.1f}s")

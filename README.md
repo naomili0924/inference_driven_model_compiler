@@ -175,7 +175,7 @@ automatically — no hand-written `OnnxConfig` required.
 
 ```python
 import torch
-from inference_driven_model_compiler.optimum.onnxruntime import ORTDiffusionPipeline
+from inference_driven_model_compiler.optimum.onnxruntime import OnTheFlyORTDiffusionPipeline
 
 inf_kwargs = {
     "prompt": "A cat walks on the grass, realistic",
@@ -186,7 +186,7 @@ inf_kwargs = {
     "guidance_scale": 5.0,
 }
 
-pipe = ORTDiffusionPipeline.from_pretrained(
+pipe = OnTheFlyORTDiffusionPipeline.from_pretrained(
     "Wan-AI/Wan2.1-T2V-1.3B-Diffusers",
     provider="CUDAExecutionProvider",
     torch_dtype=torch.float16,
@@ -220,7 +220,7 @@ decoder, then runs the whole pipeline through ONNX Runtime.
 
 ```python
 import torch
-from inference_driven_model_compiler.optimum.onnxruntime import ORTDiffusionPipeline
+from inference_driven_model_compiler.optimum.onnxruntime import OnTheFlyORTDiffusionPipeline
 
 inf_kwargs = {
     "prompt": "A cinematic photo of a red panda astronaut on the moon",
@@ -228,7 +228,7 @@ inf_kwargs = {
     "guidance_scale": 0.0,        # no classifier-free guidance
 }
 
-pipe = ORTDiffusionPipeline.from_pretrained(
+pipe = OnTheFlyORTDiffusionPipeline.from_pretrained(
     "stabilityai/sdxl-turbo",
     provider="CUDAExecutionProvider",
     torch_dtype=torch.float16,
@@ -261,7 +261,7 @@ This exports four ONNX submodules and immediately loads them into ORT sessions:
 
 Image-editing models — e.g. **InstructPix2Pix** (`timbrooks/instruct-pix2pix`) —
 take an **input image plus a text instruction** and produce an edited image.
-`ORTImageEditPipeline` handles the two things that make them different from
+`OnTheFlyORTImageEditPipeline` handles the two things that make them different from
 text-to-image:
 
 - the input image is encoded to latents through the **VAE encoder**
@@ -276,7 +276,7 @@ exported to ONNX at the traced resolution.
 ```python
 import torch
 from PIL import Image
-from inference_driven_model_compiler.optimum.onnxruntime import ORTImageEditPipeline
+from inference_driven_model_compiler.optimum.onnxruntime import OnTheFlyORTImageEditPipeline
 
 inf_kwargs = {
     "prompt": "turn him into a cyborg",
@@ -286,7 +286,7 @@ inf_kwargs = {
     "guidance_scale": 7.5,
 }
 
-pipe = ORTImageEditPipeline.from_pretrained(
+pipe = OnTheFlyORTImageEditPipeline.from_pretrained(
     "timbrooks/instruct-pix2pix",
     provider="CUDAExecutionProvider",
     torch_dtype=torch.float32,
@@ -310,10 +310,10 @@ image becomes a proper latent distribution):
 | `vae_decoder` | `vae_decoder/model.onnx` | decodes the final latents → image |
 
 The concrete diffusers pipeline is resolved from the checkpoint's `_class_name`
-and mixed into `ORTImageEditPipeline` on the fly, so other image-conditioned
+and mixed into `OnTheFlyORTImageEditPipeline` on the fly, so other image-conditioned
 pipelines (img2img, SDXL InstructPix2Pix, upscaling, …) export and run through
 the same class without a model-specific subclass. For pure text-to-image, use
-`ORTDiffusionPipeline` instead.
+`OnTheFlyORTDiffusionPipeline` instead.
 
 > InstructPix2Pix uses the SD-1.5 VAE, which is fp16-fragile on some images.
 > The example above exports in **fp32** (the model is small, ~1 GB); switch to
@@ -328,7 +328,7 @@ and re-exports on every call. To keep them — and reuse them without re-exporti
 
 ```python
 # 1. Export once...
-pipe = ORTImageEditPipeline.from_pretrained(
+pipe = OnTheFlyORTImageEditPipeline.from_pretrained(
     "timbrooks/instruct-pix2pix",
     provider="CUDAExecutionProvider", torch_dtype=torch.float32,
     export_by_inference=True, inference_kwargs=inf_kwargs,
@@ -353,7 +353,7 @@ for graphs over 2 GB), the per-submodule `config.json`, the `scheduler/` /
 
 ```python
 # From a local directory or a Hub repo — no PyTorch, no re-export.
-pipe = ORTImageEditPipeline.from_pretrained(
+pipe = OnTheFlyORTImageEditPipeline.from_pretrained(
     "your-username/instruct-pix2pix-onnx",   # or a local path
     export=False,
     provider="CUDAExecutionProvider",
@@ -361,7 +361,7 @@ pipe = ORTImageEditPipeline.from_pretrained(
 edited = pipe(**inf_kwargs).images[0]
 
 # Generic text-to-image works the same way:
-pipe = ORTDiffusionPipeline.from_pretrained(
+pipe = OnTheFlyORTDiffusionPipeline.from_pretrained(
     "optimum/stable-diffusion-v1-5",   # Hub repo with pre-exported ONNX weights
     export=False,
 )
@@ -383,7 +383,15 @@ pipe = ORTDiffusionPipeline.from_pretrained(
 ## Available classes
 
 All live in `inference_driven_model_compiler.optimum.onnxruntime` and share the
-same `from_pretrained(...)` interface:
+same `from_pretrained(...)` interface.
+
+**Naming convention:** every user-facing **entry point** carries the
+`OnTheFlyORT` prefix — it marks the inference-driven (on-the-fly export) path and
+keeps these classes from colliding with stock optimum's `ORT*` names. Internal
+ONNX **submodule wrappers** (`ORTUnet`, `ORTVaeEncoder`, `ORTVae`, …) keep the
+bare `ORT` prefix. The pre-rename names (`ORTDiffusionPipeline`,
+`ORTImageEditPipeline`, `ORTModelForImageTextToText`, `ORTChatterboxPipeline`)
+remain importable as **deprecated aliases**, so existing code keeps working.
 
 ### Transformer models
 
@@ -400,8 +408,8 @@ same `from_pretrained(...)` interface:
 
 | Class | Purpose |
 |---|---|
-| `ORTDiffusionPipeline` | Generic base — wraps **any** `diffusers.DiffusionPipeline` |
-| `ORTImageEditPipeline` | Image-editing models (InstructPix2Pix, img2img, …) — encodes an input image via the VAE encoder |
+| `OnTheFlyORTDiffusionPipeline` | Generic base — wraps **any** `diffusers.DiffusionPipeline` |
+| `OnTheFlyORTImageEditPipeline` | Image-editing models (InstructPix2Pix, img2img, …) — encodes an input image via the VAE encoder |
 | `ORTUnet` | ORT session wrapper for a UNet2D/3D denoiser |
 | `ORTTransformer` | ORT session wrapper for a DiT/transformer denoiser |
 | `ORTTextEncoder` | ORT session wrapper for a text encoder |
@@ -409,7 +417,7 @@ same `from_pretrained(...)` interface:
 | `ORTVaeDecoder` | ORT session wrapper for a VAE decoder |
 | `ORTVae` | Combines `ORTVaeEncoder` + `ORTVaeDecoder` behind the standard `vae` API |
 
-`ORTDiffusionPipeline` requires no model-specific subclass. When called as the
+`OnTheFlyORTDiffusionPipeline` requires no model-specific subclass. When called as the
 base class it reads `_class_name` from the model's `model_index.json` and creates
 an `ORT<ClassName>` wrapper on the fly via `_make_ort_pipeline_class`. Every
 diffusers pipeline — including ones not yet written — is handled automatically.
@@ -444,7 +452,7 @@ Supported text-to-video pipeline names (as of diffusers 0.38):
 |---|---|---|---|
 | Wan2.1-T2V-1.3B | `WanPipeline` | text_encoder, transformer, vae_decoder | Verified end-to-end on CUDA; 50-step inference at ~7.4 it/s |
 | SDXL-Turbo | `StableDiffusionXLPipeline` | text_encoder, text_encoder_2, unet, vae_decoder | Text-to-image; verified end-to-end on CUDA (1-step). VAE decoder exported in fp32. |
-| InstructPix2Pix | `StableDiffusionInstructPix2PixPipeline` | text_encoder, unet, **vae_encoder**, vae_decoder | Image editing via `ORTImageEditPipeline`; verified end-to-end on CUDA (fp32, 10-step ~9.7 it/s). Exercises the VAE **encoder** (input image → latents) and the 8-channel UNet. Save→Hub→reload round-trip verified. |
+| InstructPix2Pix | `StableDiffusionInstructPix2PixPipeline` | text_encoder, unet, **vae_encoder**, vae_decoder | Image editing via `OnTheFlyORTImageEditPipeline`; verified end-to-end on CUDA (fp32, 10-step ~9.7 it/s). Exercises the VAE **encoder** (input image → latents) and the 8-channel UNet. Save→Hub→reload round-trip verified. |
 
 ---
 
@@ -495,7 +503,7 @@ from_pretrained(export_by_inference=True)
 ### Diffusion pipelines
 
 ```
-ORTDiffusionPipeline.from_pretrained(export_by_inference=True, inference_kwargs={...})
+OnTheFlyORTDiffusionPipeline.from_pretrained(export_by_inference=True, inference_kwargs={...})
         │
         ▼
 1. Load the PyTorch diffusion pipeline (diffusers)
@@ -521,7 +529,7 @@ ORTDiffusionPipeline.from_pretrained(export_by_inference=True, inference_kwargs=
    ONNX needs one call over the full latent video)
         │
         ▼
-6. ORTDiffusionPipeline loaded with each ONNX submodule in an ORT session
+6. OnTheFlyORTDiffusionPipeline loaded with each ONNX submodule in an ORT session
 ```
 
 ### Dynamic-axis inference
@@ -569,7 +577,7 @@ inference_driven_model_compiler/
 │   └── onnxruntime/
 │       ├── modeling.py           # _OnTheFlyORTMixin + 5 encoder model classes
 │       ├── modeling_decoder.py   # OnTheFlyORTModelForCausalLM
-│       ├── modeling_diffusion.py # ORTDiffusionPipeline + submodule wrappers
+│       ├── modeling_diffusion.py # OnTheFlyORTDiffusionPipeline + submodule wrappers
 │       └── utils.py              # load_shapes_as_torch_size and helpers
 └── on_the_fly_pipeline_tests/    # per-model tests + dynamic-axis + diffusion suites
 ```

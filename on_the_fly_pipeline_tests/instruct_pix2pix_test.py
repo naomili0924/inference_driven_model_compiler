@@ -5,7 +5,7 @@ on the fly by tracing one real inference pass, then run generation entirely
 through ONNX Runtime — but for an *image-editing* model.
 
 InstructPix2Pix (``timbrooks/instruct-pix2pix``) is UNet-based like SD-1.5, with
-two image-editing specifics that ``ORTImageEditPipeline`` exercises during the
+two image-editing specifics that ``OnTheFlyORTImageEditPipeline`` exercises during the
 single tracing pass:
 
   * the input image is encoded to latents through the **VAE encoder**
@@ -25,7 +25,7 @@ import io
 import torch
 
 from inference_driven_model_compiler.optimum.onnxruntime.modeling_diffusion import (
-    ORTImageEditPipeline,
+    OnTheFlyORTImageEditPipeline,
 )
 
 model_id = "timbrooks/instruct-pix2pix"
@@ -75,7 +75,7 @@ module_fixed_axis_fields = {
     "vae_decoder":  ["latent_channels"],
 }
 
-pipe = ORTImageEditPipeline.from_pretrained(
+pipe = OnTheFlyORTImageEditPipeline.from_pretrained(
     model_id,
     provider=providers[0],  # Force GPU
     torch_dtype=torch.float32,

@@ -18,7 +18,7 @@ Run (needs a GPU + ~7 GB download for the model):
 import torch
 
 from inference_driven_model_compiler.optimum.onnxruntime.modeling_diffusion import (
-    ORTDiffusionPipeline,
+    OnTheFlyORTDiffusionPipeline,
 )
 
 model_id = "stabilityai/sdxl-turbo"
@@ -43,7 +43,7 @@ module_fixed_axis_fields = {
     "vae_decoder":    ["latent_channels"],
 }
 
-pipe = ORTDiffusionPipeline.from_pretrained(
+pipe = OnTheFlyORTDiffusionPipeline.from_pretrained(
     model_id,
     provider=providers[0],  # Force GPU
     torch_dtype=torch.float16,

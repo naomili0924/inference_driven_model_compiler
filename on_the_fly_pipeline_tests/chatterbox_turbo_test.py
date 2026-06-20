@@ -1,7 +1,7 @@
-"""ORTChatterboxPipeline.from_pretrained smoke + parity test (chatterbox-turbo TTS).
+"""OnTheFlyORTChatterboxPipeline.from_pretrained smoke + parity test (chatterbox-turbo TTS).
 
 Loads a pre-exported chatterbox-turbo ONNX bundle (the 4 leaf graphs produced by
-``chatterbox_export.py``) through ``ORTChatterboxPipeline.from_pretrained`` and:
+``chatterbox_export.py``) through ``OnTheFlyORTChatterboxPipeline.from_pretrained`` and:
 
   1. SMOKE   — runs generate() and checks the audio is finite and non-empty.
   2. PARITY  — greedy-decodes the T3 backbone in PyTorch vs ONNX with identical
@@ -25,7 +25,7 @@ import sys
 import numpy as np
 import torch
 
-from inference_driven_model_compiler.ort_chatterbox import ORTChatterboxPipeline
+from inference_driven_model_compiler.ort_chatterbox import OnTheFlyORTChatterboxPipeline
 
 
 def _greedy_tokens(tts, text, seed=0, max_gen_len=150):
@@ -62,8 +62,8 @@ def main():
     failures = []
 
     # ---- load via from_pretrained ----
-    print(f">>> ORTChatterboxPipeline.from_pretrained({args.source!r}, device={args.device!r})")
-    pipe = ORTChatterboxPipeline.from_pretrained(args.source, device=args.device, token=args.token)
+    print(f">>> OnTheFlyORTChatterboxPipeline.from_pretrained({args.source!r}, device={args.device!r})")
+    pipe = OnTheFlyORTChatterboxPipeline.from_pretrained(args.source, device=args.device, token=args.token)
 
     # ---- 1. SMOKE ----
     wav = pipe.generate(args.text)

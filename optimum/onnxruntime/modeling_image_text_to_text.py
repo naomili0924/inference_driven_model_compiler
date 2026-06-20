@@ -25,8 +25,8 @@ Scope of this first milestone (intentionally minimal):
 
 Usage::
 
-    from optimum.onnxruntime.modeling_image_text_to_text import ORTModelForImageTextToText
-    m = ORTModelForImageTextToText.from_pretrained("Qwen/Qwen2-VL-2B-Instruct", image_size=196)
+    from optimum.onnxruntime.modeling_image_text_to_text import OnTheFlyORTModelForImageTextToText
+    m = OnTheFlyORTModelForImageTextToText.from_pretrained("Qwen/Qwen2-VL-2B-Instruct", image_size=196)
     print(m.generate(image=pil_image, text="What is in this image?", max_new_tokens=32))
 """
 from __future__ import annotations
@@ -130,7 +130,7 @@ def _cache_dims(config):
     return int(n_layers), int(n_kv), int(head_dim)
 
 
-class ORTModelForImageTextToText:
+class OnTheFlyORTModelForImageTextToText:
     """ONNX Runtime image-text-to-text pipeline (Qwen-VL family, fixed resolution)."""
 
     def __init__(self, *, embed_session, vision_session, decoder_session, processor,
@@ -372,3 +372,8 @@ def _eos_ids(config, gen_config):
         elif isinstance(e, (list, tuple)):
             ids.update(int(x) for x in e)
     return ids or {0}
+
+
+# Deprecated alias — kept so existing imports keep working after the rename to the
+# consistent ``OnTheFlyORT*`` prefix for inference-driven entry points.
+ORTModelForImageTextToText = OnTheFlyORTModelForImageTextToText

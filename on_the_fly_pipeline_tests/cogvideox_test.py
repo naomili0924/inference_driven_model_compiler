@@ -1,7 +1,7 @@
 import torch
 from diffusers.utils import export_to_video
 
-from inference_driven_model_compiler.optimum.onnxruntime.modeling_diffusion import ORTDiffusionPipeline
+from inference_driven_model_compiler.optimum.onnxruntime.modeling_diffusion import OnTheFlyORTDiffusionPipeline
 
 providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
 
@@ -21,7 +21,7 @@ module_fixed_dynamic_axis = {
     "vae_decoder":  ["latent_channels"],
 }
 
-pipe = ORTDiffusionPipeline.from_pretrained(
+pipe = OnTheFlyORTDiffusionPipeline.from_pretrained(
     "THUDM/CogVideoX-2b",
     provider=providers[0],
     torch_dtype=torch.float16,

@@ -1,4 +1,4 @@
-"""ORTChatterboxPipeline — run ResembleAI/chatterbox-turbo with ONNX Runtime.
+"""OnTheFlyORTChatterboxPipeline — run ResembleAI/chatterbox-turbo with ONNX Runtime.
 
 Mirrors how the ORT diffusion pipeline works: it loads the real
 ``ChatterboxTurboTTS`` and runs Chatterbox's OWN generation logic unchanged
@@ -19,8 +19,8 @@ Usage:
 
     HF_HOME=/dev/shm/hf PYTHONPATH=/workspace/inference_driven_model_compiler \
     /opt/cbx-venv/bin/python -c "
-    from ort_chatterbox import ORTChatterboxPipeline
-    pipe = ORTChatterboxPipeline('/dev/shm/cbx_onnx', device='cuda')
+    from ort_chatterbox import OnTheFlyORTChatterboxPipeline
+    pipe = OnTheFlyORTChatterboxPipeline('/dev/shm/cbx_onnx', device='cuda')
     wav = pipe.generate('Hello from ONNX Runtime.')
     import torchaudio; torchaudio.save('out.wav', wav, pipe.sr)"
 """
@@ -96,7 +96,7 @@ class _ORTBackbone(torch.nn.Module):
 _LEAF_DIRS = ("ve", "s3gen_estimator", "s3gen_hift", "t3_backbone")
 
 
-class ORTChatterboxPipeline:
+class OnTheFlyORTChatterboxPipeline:
     @classmethod
     def from_pretrained(cls, model_name_or_path: str, export: bool | None = None,
                         output: str | None = None, export_device: str = "cpu",
@@ -227,7 +227,7 @@ if __name__ == "__main__":
     ap.add_argument("--out", default="/dev/shm/ort_chatterbox_out.wav")
     args = ap.parse_args()
 
-    pipe = ORTChatterboxPipeline(args.onnx, device=args.device)
+    pipe = OnTheFlyORTChatterboxPipeline(args.onnx, device=args.device)
     wav = pipe.generate(args.text)
     print("generated wav:", tuple(wav.shape), "sr", pipe.sr)
     try:
@@ -236,3 +236,8 @@ if __name__ == "__main__":
         print("saved", args.out)
     except Exception as e:
         print("save skipped:", e)
+
+
+# Deprecated alias — kept so existing imports keep working after the rename to the
+# consistent ``OnTheFlyORT*`` prefix for inference-driven entry points.
+ORTChatterboxPipeline = OnTheFlyORTChatterboxPipeline

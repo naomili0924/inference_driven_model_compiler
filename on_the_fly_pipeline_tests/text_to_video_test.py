@@ -1,7 +1,7 @@
 import torch
 from diffusers.utils import export_to_video
 
-from inference_driven_model_compiler.optimum.onnxruntime.modeling_diffusion import ORTDiffusionPipeline
+from inference_driven_model_compiler.optimum.onnxruntime.modeling_diffusion import OnTheFlyORTDiffusionPipeline
 
 wan_list = [
     "Wan-AI/Wan2.1-T2V-1.3B-Diffusers",
@@ -30,7 +30,7 @@ module_fixed_dynamic_axis = {
 }
 
 
-pipe = ORTDiffusionPipeline.from_pretrained(
+pipe = OnTheFlyORTDiffusionPipeline.from_pretrained(
     wan_list[0],
     provider=providers[0],  # Force GPU
     torch_dtype=torch.float16,

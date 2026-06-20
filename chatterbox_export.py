@@ -13,7 +13,7 @@ pipeline's generic primitives:
 No edits to the shared pipeline are required: the leaf modules are plain
 ``nn.Module``s with a single, stateless ``forward``. The loops that drive them
 (T3 AR sampling, the S3Gen CFM Euler solver, HiFiGAN) live in the runtime
-``ORTChatterboxPipeline`` instead — mirroring how the diffusers scheduler loop
+``OnTheFlyORTChatterboxPipeline`` instead — mirroring how the diffusers scheduler loop
 calls an exported single-step UNet N times.
 
 Run with the chatterbox venv + the repo on PYTHONPATH:
@@ -411,7 +411,7 @@ def export_all(output_dir, modules=None, device="cpu", opset=17, atol=1e-3, tts=
     its size and is exported on CUDA). The other leaves are exported in fp32.
 
     This is the programmatic entry point used both by the CLI (``main``) and by
-    ``ORTChatterboxPipeline.from_pretrained(export=True)``.
+    ``OnTheFlyORTChatterboxPipeline.from_pretrained(export=True)``.
     """
     modules = modules or ALL_MODULES
     for name in modules:

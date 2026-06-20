@@ -101,13 +101,13 @@ def cmd_export(args):
 
     if args.task == "diffusion" or _is_diffusion_model(args.model):
         from inference_driven_model_compiler.optimum.onnxruntime.modeling_diffusion import (
-            ORTDiffusionPipeline,
+            OnTheFlyORTDiffusionPipeline,
         )
 
         fixed_axes = args.fixed_axes or {}
 
         print(f"Exporting diffusion pipeline '{args.model}' → {output}")
-        pipe = ORTDiffusionPipeline.from_pretrained(
+        pipe = OnTheFlyORTDiffusionPipeline.from_pretrained(
             args.model,
             provider=args.provider,
             torch_dtype=torch_dtype,

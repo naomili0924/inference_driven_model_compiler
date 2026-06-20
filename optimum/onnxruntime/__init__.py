@@ -7,8 +7,10 @@ from .modeling import (
     OnTheFlyORTModelForQuestionAnswering,
 )
 from .modeling_diffusion import (
-    ORTDiffusionPipeline,
-    ORTImageEditPipeline,
+    OnTheFlyORTDiffusionPipeline,
+    OnTheFlyORTImageEditPipeline,
+    ORTDiffusionPipeline,    # deprecated alias of OnTheFlyORTDiffusionPipeline
+    ORTImageEditPipeline,    # deprecated alias of OnTheFlyORTImageEditPipeline
     ORTModelMixin,
     ORTUnet,
     ORTTransformer,
@@ -25,8 +27,10 @@ __all__ = [
     "OnTheFlyORTModelForSequenceClassification",
     "OnTheFlyORTModelForTokenClassification",
     "OnTheFlyORTModelForQuestionAnswering",
-    "ORTDiffusionPipeline",
-    "ORTImageEditPipeline",
+    "OnTheFlyORTDiffusionPipeline",
+    "OnTheFlyORTImageEditPipeline",
+    "ORTDiffusionPipeline",       # deprecated alias
+    "ORTImageEditPipeline",       # deprecated alias
     "ORTModelMixin",
     "ORTUnet",
     "ORTTransformer",
